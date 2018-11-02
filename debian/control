@@ -1,0 +1,51 @@
+Source: egl-wayland
+Priority: optional
+Maintainer: Timo Aaltonen <tjaalton@debian.org>
+Build-Depends:
+ debhelper (>= 11),
+ eglexternalplatform-dev,
+ libegl1-mesa-dev,
+ libwayland-dev,
+ meson,
+ pkg-config,
+Standards-Version: 4.2.1
+Section: libs
+Homepage: https://github.com/NVIDIA/egl-wayland
+Vcs-Git: https://salsa.debian.org/debian/egl-wayland.git
+Vcs-Browser: https://salsa.debian.org/debian/egl-wayland.git
+
+Package: libnvidia-egl-wayland-dev
+Section: libdevel
+Architecture: any
+Multi-Arch: same
+Depends: libnvidia-egl-wayland1 (= ${binary:Version}),
+ ${misc:Depends}
+Description: Wayland EGL External Platform library -- development files
+ This is a work-in-progress implementation of a EGL (Embedded-System
+ Graphics Library) External Platform library to add client-side Wayland
+ support to EGL on top of EGLDevice and EGLStream families of extensions.
+ .
+ This library implements an EGL External Platform interface to work along
+ with EGL drivers that support the external platform mechanism. More
+ information about EGL External platforms and the interface can be found at:
+ .
+ https://github.com/NVIDIA/eglexternalplatform
+ .
+ This package contains the development files.
+
+Package: libnvidia-egl-wayland1
+Architecture: any
+Multi-Arch: same
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: Wayland EGL External Platform library -- shared library
+ This is a work-in-progress implementation of a EGL (Embedded-System
+ Graphics Library) External Platform library to add client-side Wayland
+ support to EGL on top of EGLDevice and EGLStream families of extensions.
+ .
+ This library implements an EGL External Platform interface to work along
+ with EGL drivers that support the external platform mechanism. More
+ information about EGL External platforms and the interface can be found at:
+ .
+ https://github.com/NVIDIA/eglexternalplatform
+ .
+ This package contains the shared library.

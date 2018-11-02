@@ -1,0 +1,203 @@
+Description: sync to current master
+
+pull these fixes:
+
+e3b96b859d6a6d8 Fix exports regression
+6d43a263ef6a5f3 Build with -Wall -Werror
+01230362591fe4b Properly generate private/public protocols
+0eb29d4a84788b2 meson: replace 'private-code' on 'public-code'
+
+diff --git a/Makefile.am b/Makefile.am
+index 8b81259..70bcfc9 100644
+--- a/Makefile.am
++++ b/Makefile.am
+@@ -9,10 +9,11 @@ libnvidia_egl_wayland_la_CFLAGS =       \
+     -I$(top_builddir)/wayland-eglstream
+ 
+ # Required library flags
+-libnvidia_egl_wayland_la_CFLAGS +=  \
+-    $(PTHREAD_CFLAGS)               \
+-    $(EGL_EXTERNAL_PLATFORM_CFLAGS) \
+-    $(WAYLAND_CFLAGS)
++libnvidia_egl_wayland_la_CFLAGS +=      \
++    $(PTHREAD_CFLAGS)                   \
++    $(EGL_EXTERNAL_PLATFORM_CFLAGS)     \
++    $(WAYLAND_CFLAGS)                   \
++    $(COMPILER_FLAG_VISIBILITY_HIDDEN)
+ 
+ # Make sure we don't use deprecated stuff
+ libnvidia_egl_wayland_la_CFLAGS += \
+@@ -37,13 +38,25 @@ libnvidia_egl_wayland_la_SOURCES =                            \
+     src/wayland-eglhandle.c                                   \
+     src/wayland-external-exports.c
+ 
+-libnvidia_egl_wayland_la_built_sources =                             \
+-    wayland-eglstream/wayland-eglstream-protocol.c                   \
+-    wayland-eglstream/wayland-eglstream-client-protocol.h            \
+-    wayland-eglstream/wayland-eglstream-server-protocol.h            \
+-    wayland-eglstream/wayland-eglstream-controller-protocol.c        \
++libnvidia_egl_wayland_la_built_public_protocols =             \
++    wayland-eglstream/wayland-eglstream-controller-protocol.c
++
++libnvidia_egl_wayland_la_built_private_protocols =            \
++    wayland-eglstream/wayland-eglstream-protocol.c
++
++libnvidia_egl_wayland_la_built_client_headers =               \
++    wayland-eglstream/wayland-eglstream-client-protocol.h     \
+     wayland-eglstream/wayland-eglstream-controller-client-protocol.h
+ 
++libnvidia_egl_wayland_la_built_server_headers =               \
++    wayland-eglstream/wayland-eglstream-server-protocol.h
++
++libnvidia_egl_wayland_la_built_sources =                      \
++    $(libnvidia_egl_wayland_la_built_public_protocols)        \
++    $(libnvidia_egl_wayland_la_built_private_protocols)       \
++    $(libnvidia_egl_wayland_la_built_client_headers)          \
++    $(libnvidia_egl_wayland_la_built_server_headers)
++
+ nodist_libnvidia_egl_wayland_la_SOURCES = $(libnvidia_egl_wayland_la_built_sources)
+ 
+ dist_pkgdata_DATA =                                    \
+@@ -62,11 +75,22 @@ CLEANFILES =                                  \
+ 
+ $(libnvidia_egl_wayland_la_SOURCES): $(libnvidia_egl_wayland_la_built_sources)
+ 
+-%-protocol.c : %.xml
+-	$(AM_V_GEN)$(WAYLAND_SCANNER) code < $< > $@
++if WAYLAND_SCANNER_HAS_PRIVATE_CODE
++    WAYLAND_PUBLIC_CODEGEN = public-code
++    WAYLAND_PRIVATE_CODEGEN = private-code
++else
++    WAYLAND_PUBLIC_CODEGEN = code
++    WAYLAND_PRIVATE_CODEGEN = code
++endif
++
++$(libnvidia_egl_wayland_la_built_public_protocols):%-protocol.c : %.xml
++	$(AM_V_GEN)$(WAYLAND_SCANNER) $(WAYLAND_PUBLIC_CODEGEN) < $< > $@
++
++$(libnvidia_egl_wayland_la_built_private_protocols):%-protocol.c : %.xml
++	$(AM_V_GEN)$(WAYLAND_SCANNER) $(WAYLAND_PRIVATE_CODEGEN) < $< > $@
+ 
+-%-client-protocol.h : %.xml
++$(libnvidia_egl_wayland_la_built_client_headers):%-client-protocol.h : %.xml
+ 	$(AM_V_GEN)$(WAYLAND_SCANNER) client-header < $< > $@
+ 
+-%-server-protocol.h : %.xml
++$(libnvidia_egl_wayland_la_built_server_headers):%-server-protocol.h : %.xml
+ 	$(AM_V_GEN)$(WAYLAND_SCANNER) server-header < $< > $@
+diff --git a/configure.ac b/configure.ac
+index b55cd99..90605f8 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -48,6 +48,8 @@ if test x$WAYLAND_SCANNER = x; then
+     PKG_CHECK_MODULES(WAYLAND_SCANNER, [wayland-scanner])
+     WAYLAND_SCANNER=`$PKG_CONFIG --variable=wayland_scanner wayland-scanner`
+ fi
++AM_CONDITIONAL([WAYLAND_SCANNER_HAS_PRIVATE_CODE],
++               [test x$WAYLAND_SCANNER = x`$PKG_CONFIG --variable=wayland_scanner "wayland-scanner >= 1.14.91"`])
+ 
+ # Initialize libtool
+ LT_PREREQ([2.2])
+@@ -74,13 +76,18 @@ AC_TYPE_UINT32_T
+ AC_FUNC_MALLOC
+ AC_CHECK_FUNCS([getpagesize inet_ntoa memset socket strcasecmp strstr])
+ 
++# See if the compiler supports the -fvisibility=hidden flag.
++AX_CHECK_COMPILE_FLAG([-fvisibility=hidden],
++      [AC_SUBST([COMPILER_FLAG_VISIBILITY_HIDDEN], ["-fvisibility=hidden"])],
++      [AC_SUBST([COMPILER_FLAG_VISIBILITY_HIDDEN], [""])])
++
+ # See if the linker supports the --no-undefined flag.
+ AX_CHECK_LINK_FLAG([-Xlinker --no-undefined],
+       [AC_SUBST([LINKER_FLAG_NO_UNDEFINED], ["-Xlinker --no-undefined"])],
+       [AC_SUBST([LINKER_FLAG_NO_UNDEFINED], [""])])
+ 
+ # Default CFLAGS
+-CFLAGS="$CFLAGS -Wall -Wno-deprecated-declarations -Werror -include config.h"
++CFLAGS="$CFLAGS -Wall -Werror -include config.h"
+ 
+ PKG_NOARCH_INSTALLDIR
+ 
+diff --git a/include/wayland-external-exports.h b/include/wayland-external-exports.h
+index 9114663..6925302 100644
+--- a/include/wayland-external-exports.h
++++ b/include/wayland-external-exports.h
+@@ -60,6 +60,9 @@
+ #define EGL_EXTERNAL_PLATFORM_VERSION_MINOR WAYLAND_EXTERNAL_VERSION_MINOR
+ #include <eglexternalplatform.h>
+ 
++#include <wayland-util.h>
++
++WL_EXPORT
+ EGLBoolean loadEGLExternalPlatform(int major, int minor,
+                                    const EGLExtDriver *driver,
+                                    EGLExtPlatform *platform);
+diff --git a/src/meson.build b/src/meson.build
+index 1747ea4..50b50ef 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -4,17 +4,14 @@ else
+   libdl = []
+ endif
+ 
++add_project_arguments('-Wall', language : 'c')
++add_project_arguments('-Werror', language : 'c')
++add_project_arguments('-fvisibility=hidden', language : 'c')
+ add_project_link_arguments('-Wl,-Bsymbolic', language : 'c')
+ 
+-foreach arg : [
+-               'unused-parameter',
+-               'pedantic',
+-               'deprecated-declarations',
+-              ]
+-        if cc.has_argument('-W' + arg)
+-                add_project_arguments('-Wno-' + arg, language : 'c')
+-        endif
+-endforeach
++if cc.has_argument('-Wpedantic')
++        add_project_arguments('-Wno-pedantic', language : 'c')
++endif
+ 
+ src = [
+     'wayland-api-lock.c',
+diff --git a/src/wayland-eglsurface.c b/src/wayland-eglsurface.c
+index 531eaf2..6dc5b54 100644
+--- a/src/wayland-eglsurface.c
++++ b/src/wayland-eglsurface.c
+@@ -84,7 +84,7 @@ wayland_throttleCallback(void *data,
+ 
+     surface->throttleCallback = NULL;
+     wl_callback_destroy(callback);
+-};
++}
+ 
+ static const struct wl_callback_listener throttle_listener = {
+     wayland_throttleCallback
+diff --git a/wayland-eglstream/meson.build b/wayland-eglstream/meson.build
+index b81767c..a713900 100644
+--- a/wayland-eglstream/meson.build
++++ b/wayland-eglstream/meson.build
+@@ -1,9 +1,12 @@
+-generated_protocols = [
++generated_private_protocols = [
+     'wayland-eglstream',
++]
++
++generated_public_protocols = [
+     'wayland-eglstream-controller',
+ ]
+ 
+-foreach proto : generated_protocols
++foreach proto : generated_private_protocols + generated_public_protocols
+     foreach output_type: ['client-header', 'server-header', 'private-code']
+         if output_type == 'client-header'
+             output_file = '@0@-client-protocol.h'.format(proto)
+@@ -13,6 +16,8 @@ foreach proto : generated_protocols
+             output_file = '@0@-protocol.c'.format(proto)
+             if wl_scanner.version().version_compare('< 1.14.91')
+                 output_type = 'code'
++            elif generated_public_protocols.contains(proto)
++                output_type = 'public-code'
+             endif
+         endif
+ 

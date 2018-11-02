@@ -1,0 +1,3 @@
+usr/lib/*/libnvidia-egl-wayland.so
+usr/lib/*/pkgconfig
+usr/share/wayland-eglstream
