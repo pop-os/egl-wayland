@@ -2,7 +2,7 @@ AC_PREREQ([2.64])
 
 m4_define([wayland_eglstream_major_version], [1])
 m4_define([wayland_eglstream_minor_version], [1])
-m4_define([wayland_eglstream_micro_version], [0])
+m4_define([wayland_eglstream_micro_version], [1])
 m4_define([wayland_eglstream_version],
           [wayland_eglstream_major_version.wayland_eglstream_minor_version.wayland_eglstream_micro_version])
 
@@ -48,6 +48,8 @@ if test x$WAYLAND_SCANNER = x; then
     PKG_CHECK_MODULES(WAYLAND_SCANNER, [wayland-scanner])
     WAYLAND_SCANNER=`$PKG_CONFIG --variable=wayland_scanner wayland-scanner`
 fi
+AM_CONDITIONAL([WAYLAND_SCANNER_HAS_PRIVATE_CODE],
+               [test x$WAYLAND_SCANNER = x`$PKG_CONFIG --variable=wayland_scanner "wayland-scanner >= 1.14.91"`])
 
 # Initialize libtool
 LT_PREREQ([2.2])
@@ -59,7 +61,7 @@ AC_CHECK_LIB([dl], [dlsym],
              [],
              [AC_MSG_ERROR("dlsym is needed to compile wayland-external")])
 PKG_CHECK_MODULES([EGL_EXTERNAL_PLATFORM], [eglexternalplatform >= ${EGL_EXTERNAL_PLATFORM_MIN_VERSION} eglexternalplatform < ${EGL_EXTERNAL_PLATFORM_MAX_VERSION}])
-PKG_CHECK_MODULES([WAYLAND], [wayland-server wayland-client])
+PKG_CHECK_MODULES([WAYLAND], [wayland-server wayland-client wayland-egl-backend >= 3])
 
 # Checks for header files.
 AC_CHECK_HEADERS([arpa/inet.h stddef.h stdint.h stdlib.h string.h sys/socket.h unistd.h])
@@ -74,13 +76,18 @@ AC_TYPE_UINT32_T
 AC_FUNC_MALLOC
 AC_CHECK_FUNCS([getpagesize inet_ntoa memset socket strcasecmp strstr])
 
+# See if the compiler supports the -fvisibility=hidden flag.
+AX_CHECK_COMPILE_FLAG([-fvisibility=hidden],
+      [AC_SUBST([COMPILER_FLAG_VISIBILITY_HIDDEN], ["-fvisibility=hidden"])],
+      [AC_SUBST([COMPILER_FLAG_VISIBILITY_HIDDEN], [""])])
+
 # See if the linker supports the --no-undefined flag.
 AX_CHECK_LINK_FLAG([-Xlinker --no-undefined],
       [AC_SUBST([LINKER_FLAG_NO_UNDEFINED], ["-Xlinker --no-undefined"])],
       [AC_SUBST([LINKER_FLAG_NO_UNDEFINED], [""])])
 
 # Default CFLAGS
-CFLAGS="$CFLAGS -Wall -Wno-deprecated-declarations -Werror -include config.h"
+CFLAGS="$CFLAGS -Wall -Werror -include config.h"
 
 PKG_NOARCH_INSTALLDIR
 

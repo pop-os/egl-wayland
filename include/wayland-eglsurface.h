@@ -72,9 +72,14 @@ typedef struct WlEglSurfaceRec {
     struct wl_callback    *throttleCallback;
 
     struct wl_list link;
+
+    EGLBoolean isSurfaceProducer;
 } WlEglSurface;
 
 extern struct wl_list wlEglSurfaceList;
+
+WL_EXPORT
+EGLBoolean wlEglInitializeSurfaceExport(WlEglSurface *surface);
 
 EGLSurface wlEglCreatePlatformWindowSurfaceHook(EGLDisplay dpy,
                                                 EGLConfig config,
@@ -102,7 +107,8 @@ EGLBoolean wlEglQueryNativeResourceHook(EGLDisplay dpy,
                                         EGLint attribute,
                                         int *value);
 
-EGLBoolean wlEglSendDamageEvent(WlEglSurface *surface);
+EGLBoolean wlEglSendDamageEvent(WlEglSurface *surface,
+                                struct wl_event_queue *queue);
 
 void wlEglCreateFrameSync(WlEglSurface *surface, struct wl_event_queue *queue);
 EGLint wlEglWaitFrameSync(WlEglSurface *surface, struct wl_event_queue *queue);

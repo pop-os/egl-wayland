@@ -27,6 +27,7 @@
 #include <EGL/eglext.h>
 #include "wayland-external-exports.h"
 #include "wayland-egl-ext.h"
+#include <pthread.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -96,6 +97,8 @@ typedef struct WlEglPlatformDataRec {
         PWLEGLFNGETERRORCOREPROC                    getError;
         PWLEGLFNRELEASETHREADCOREPROC               releaseThread;
 
+        PFNEGLQUERYDISPLAYATTRIBKHRPROC             queryDisplayAttrib;
+
         /* Used for fifo_synchronous support */
         PFNEGLQUERYSTREAMKHRPROC                    queryStream;
         PFNEGLQUERYSTREAMU64KHRPROC                 queryStreamu64;
@@ -111,6 +114,9 @@ typedef struct WlEglPlatformDataRec {
         PEGLEXTFNSETERROR           setError;
         PEGLEXTFNSTREAMSWAPINTERVAL streamSwapInterval;
     } callbacks;
+
+    /* pthread key for TLS */
+    pthread_key_t tlsKey;
 } WlEglPlatformData;
 
 
