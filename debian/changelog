@@ -1,5 +1,5 @@
-egl-wayland (1.1.1-1) UNRELEASED; urgency=medium
+egl-wayland (1:1.1.1-1) unstable; urgency=medium
 
   * Initial release (Closes: #912945)
 
- -- Timo Aaltonen <tjaalton@debian.org>  Mon, 03 Dec 2018 11:15:19 +0200
+ -- Timo Aaltonen <tjaalton@debian.org>  Fri, 07 Dec 2018 11:39:24 +0200
