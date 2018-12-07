@@ -6,6 +6,7 @@ Build-Depends:
  eglexternalplatform-dev,
  libegl1-mesa-dev,
  libwayland-dev,
+ libwayland-egl-backend-dev,
  meson,
  pkg-config,
 Standards-Version: 4.2.1
