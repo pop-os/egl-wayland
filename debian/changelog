@@ -1,3 +1,9 @@
+egl-wayland (1:1.1.1-2) UNRELEASED; urgency=medium
+
+  * control: Fix Conflicts/Replaces. (Closes: #918653, #918654)
+
+ -- Timo Aaltonen <tjaalton@debian.org>  Tue, 08 Jan 2019 12:04:09 +0200
+
 egl-wayland (1:1.1.1-1) unstable; urgency=medium
 
   * Initial release (Closes: #912945)

@@ -21,16 +21,6 @@ Architecture: any
 Multi-Arch: same
 Depends: libnvidia-egl-wayland1 (= ${binary:Version}),
  ${misc:Depends}
-Conflicts:
- libnvidia-gl-390,
- libnvidia-gl-410,
- libnvidia-legacy-390xx-egl-wayland1,
- nvidia-egl-wayland-common,
-Replaces:
- libnvidia-gl-390,
- libnvidia-gl-410,
- libnvidia-legacy-390xx-egl-wayland1,
- nvidia-egl-wayland-common,
 Description: Wayland EGL External Platform library -- development files
  This is a work-in-progress implementation of a EGL (Embedded-System
  Graphics Library) External Platform library to add client-side Wayland
@@ -48,6 +38,16 @@ Package: libnvidia-egl-wayland1
 Architecture: any
 Multi-Arch: same
 Depends: ${shlibs:Depends}, ${misc:Depends}
+Conflicts:
+ libnvidia-gl-390,
+ libnvidia-gl-410,
+ libnvidia-legacy-390xx-egl-wayland1,
+ nvidia-egl-wayland-common,
+Replaces:
+ libnvidia-gl-390,
+ libnvidia-gl-410,
+ libnvidia-legacy-390xx-egl-wayland1,
+ nvidia-egl-wayland-common,
 Description: Wayland EGL External Platform library -- shared library
  This is a work-in-progress implementation of a EGL (Embedded-System
  Graphics Library) External Platform library to add client-side Wayland
