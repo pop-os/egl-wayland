@@ -40,12 +40,12 @@ Multi-Arch: same
 Depends: ${shlibs:Depends}, ${misc:Depends}
 Conflicts:
  libnvidia-gl-390,
- libnvidia-gl-410 (<< 410.93-0ubuntu1),
+ libnvidia-gl-410 (<< 410.93),
  libnvidia-legacy-390xx-egl-wayland1,
  nvidia-egl-wayland-common,
 Replaces:
  libnvidia-gl-390,
- libnvidia-gl-410 (<< 410.93-0ubuntu1),
+ libnvidia-gl-410 (<< 410.93),
  libnvidia-legacy-390xx-egl-wayland1,
  nvidia-egl-wayland-common,
 Description: Wayland EGL External Platform library -- shared library
