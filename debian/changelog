@@ -1,9 +1,9 @@
-egl-wayland (1:1.1.2-1) UNRELEASED; urgency=medium
+egl-wayland (1:1.1.2-1) unstable; urgency=medium
 
   * New upstream release.
   * control: Fix C/R on libnvidia-gl-410.
 
- -- Timo Aaltonen <tjaalton@debian.org>  Mon, 04 Feb 2019 19:24:11 +0200
+ -- Timo Aaltonen <tjaalton@debian.org>  Mon, 04 Feb 2019 19:30:00 +0200
 
 egl-wayland (1:1.1.1-2) unstable; urgency=medium
 
