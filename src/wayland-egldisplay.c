@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014-2016, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2014-2018, NVIDIA CORPORATION. All rights reserved.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -67,6 +67,7 @@ EGLBoolean wlEglIsWaylandDisplay(void *nativeDpy)
 EGLBoolean wlEglIsValidNativeDisplayExport(void *data, void *nativeDpy)
 {
     char *val = getenv("EGL_PLATFORM");
+    (void) data;
 
     if (val && !strcasecmp(val, "wayland")) {
         return EGL_TRUE;
@@ -138,6 +139,7 @@ registry_handle_global(void *data,
                                                 name,
                                                 &wl_eglstream_controller_interface,
                                                 version);
+        display->wlStreamCtlVer = version;
     }
 }
 
@@ -146,6 +148,9 @@ registry_handle_global_remove(void *data,
                               struct wl_registry *registry,
                               uint32_t name)
 {
+    (void) data;
+    (void) registry;
+    (void) name;
 }
 
 static const struct wl_registry_listener registry_listener = {
@@ -159,6 +164,7 @@ eglstream_display_handle_caps(void *data,
                               int32_t caps)
 {
     WlEglDisplay *dpy = (WlEglDisplay *)data;
+    (void) wlStreamDpy;
 
 #define IS_CAP_SET(CAPS, CAP) (((CAPS)&(CAP)) != 0)
 
@@ -180,6 +186,8 @@ eglstream_display_handle_swapinterval_override(
                                     struct wl_buffer *streamResource)
 {
     WlEglSurface *surf = NULL;
+    (void) data;
+    (void) wlStreamDpy;
 
     wl_list_for_each(surf, &wlEglSurfaceList, link) {
         if (surf->ctx.wlStreamResource == streamResource) {
@@ -205,6 +213,7 @@ static void
 sync_callback(void *data, struct wl_callback *callback, uint32_t serial)
 {
     int *done = data;
+    (void) serial;
 
     *done = 1;
     wl_callback_destroy(callback);
@@ -214,19 +223,48 @@ static const struct wl_callback_listener sync_listener = {
     sync_callback
 };
 
-struct wl_event_queue* wlGetEventQueue(struct wl_display *display)
+struct wl_event_queue* wlGetEventQueue(WlEglDisplay *display)
 {
-    WlThread *wlThread = wlGetThread();
-    struct wl_event_queue *queue = NULL;
+    WlThread     *wlThread = wlGetThread();
+    WlEventQueue *evtQueue = NULL;
+    WlEventQueue *iter     = NULL;
 
     if (wlThread != NULL) {
-        if (wlThread->queue == NULL) {
-            wlThread->queue = wl_display_create_queue(display);
+        /* Try to find an existing queue in the thread list */
+        wl_list_for_each(iter, &wlThread->evtQueueList, threadLink) {
+            if (iter->display == display) {
+                evtQueue = iter;
+                break;
+            }
         }
-        queue = wlThread->queue;
+
+        /* If a valid queue was found, we are done */
+        if ((evtQueue != NULL) && (evtQueue->queue != NULL)) {
+            return evtQueue->queue;
+        }
+
+        if (evtQueue == NULL) {
+            /* Create the WlEventQueue and add it to the thread list */
+            evtQueue = calloc(1, sizeof(*evtQueue));
+            if (evtQueue == NULL) {
+                return NULL;
+            }
+
+            evtQueue->display = display;
+
+            wl_list_insert(&wlThread->evtQueueList, &evtQueue->threadLink);
+        }
+
+        /* Create the wl_event_queue, and add WlEventQueue to the dpy list */
+        evtQueue->queue = wl_display_create_queue(display->nativeDpy);
+        if (evtQueue->queue == NULL) {
+            return NULL;
+        }
+
+        wl_list_insert(&display->evtQueueList,  &evtQueue->dpyLink);
     }
 
-    return queue;
+    return (evtQueue ? evtQueue->queue : NULL);
 }
 
 int wlEglRoundtrip(WlEglDisplay *display, struct wl_event_queue *queue)
@@ -278,6 +316,8 @@ static EGLBoolean terminateDisplay(EGLDisplay dpy, EGLBoolean skipDestroy)
 {
     WlEglDisplay      *display       = (WlEglDisplay *)dpy;
     WlEglPlatformData *data          = display->data;
+    WlEventQueue      *iter          = NULL;
+    WlEventQueue      *tmp           = NULL;
     EGLBoolean         fullTerminate = EGL_FALSE;
     EGLBoolean         res           = EGL_TRUE;
 
@@ -315,8 +355,14 @@ static EGLBoolean terminateDisplay(EGLDisplay dpy, EGLBoolean skipDestroy)
         if (display->wlStreamDpy) {
             wl_eglstream_display_destroy(display->wlStreamDpy);
         }
-    }
 
+        /* Invalidate all event queues created for this display */
+        wl_list_for_each_safe(iter, tmp, &display->evtQueueList, dpyLink) {
+            wl_event_queue_destroy(iter->queue);
+            iter->queue = NULL;
+            wl_list_remove(&iter->dpyLink);
+        }
+    }
     if (display->ownNativeDpy) {
         wl_display_disconnect(display->nativeDpy);
     }
@@ -463,8 +509,9 @@ EGLDisplay wlEglGetPlatformDisplayExport(void *data,
 
     display->ownNativeDpy = ownNativeDpy;
     display->nativeDpy    = nativeDpy;
+    wl_list_init(&display->evtQueueList);
 
-    queue = wlGetEventQueue(nativeDpy);
+    queue = wlGetEventQueue(display);
     if (queue == NULL) {
         wlExternalApiUnlock();
         err = EGL_BAD_ALLOC;

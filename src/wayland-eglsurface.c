@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014-2016, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2014-2018, NVIDIA CORPORATION. All rights reserved.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -90,6 +90,7 @@ wayland_throttleCallback(void *data,
                          uint32_t time)
 {
     WlEglSurface *surface = (WlEglSurface *)data;
+    (void) time;
 
     surface->throttleCallback = NULL;
     wl_callback_destroy(callback);
@@ -121,22 +122,26 @@ EGLint wlEglWaitFrameSync(WlEglSurface *surface, struct wl_event_queue *queue)
 {
 
     WlEglDisplay *display = surface->wlEglDpy;
+    int ret = 0;
 
-    wlExternalApiUnlock();
-    while (surface->throttleCallback != NULL) {
-        if (wl_display_dispatch_queue(display->nativeDpy,
-                                      queue) == -1) {
-            break;
+    while (ret != -1 && surface->throttleCallback != NULL) {
+        wlExternalApiUnlock();
+        ret = wl_display_dispatch_queue(display->nativeDpy, queue);
+        wlExternalApiLock();
+
+        /* Bail out if the surface was destroyed while the lock was suspended */
+        if (!wlEglIsWlEglSurface(surface)) {
+            return EGL_BAD_SURFACE;
         }
     }
-    wlExternalApiLock();
 
     if (surface->throttleCallback != NULL) {
         wl_callback_destroy(surface->throttleCallback);
         surface->throttleCallback = NULL;
-        return -1;
+        return EGL_BAD_ALLOC;
     }
-    return 1;
+
+    return EGL_SUCCESS;
 }
 
 EGLBoolean
@@ -162,7 +167,7 @@ damage_thread(void *args)
     WlEglSurface          *surface = (WlEglSurface*)args;
     WlEglDisplay          *display = surface->wlEglDpy;
     WlEglPlatformData     *data    = display->data;
-    struct wl_event_queue *queue   = wlGetEventQueue(display->nativeDpy);
+    struct wl_event_queue *queue   = wlGetEventQueue(display);
     int                    ok      = (queue != NULL);
     EGLint                 state;
 
@@ -430,7 +435,7 @@ static EGLint create_surface_stream_fd(WlEglSurface *surface,
     int                   handle  = EGL_NO_FILE_DESCRIPTOR_KHR;
     struct wl_array       wlAttribs;
     EGLint                eglAttribs[] = {
-        EGL_STREAM_FIFO_LENGTH_KHR, 0, // FIFO_LENGTH == 0 to set MAILBOX mode
+        EGL_STREAM_FIFO_LENGTH_KHR, surface->fifoLength,
         EGL_NONE,                   EGL_NONE,
         EGL_NONE
     };
@@ -440,8 +445,8 @@ static EGLint create_surface_stream_fd(WlEglSurface *surface,
      * use this surface for composition or not when using cross_process_fd, so
      * just enable FIFO_SYNCHRONOUS if the extensions are supported */
     if (display->exts.stream_fifo_synchronous &&
-        display->exts.stream_sync) {
-        eglAttribs[1] = 1; // FIFO_LENGTH == 1 to set FIFO mode
+        display->exts.stream_sync &&
+        surface->fifoLength > 0) {
         eglAttribs[2] = EGL_STREAM_FIFO_SYNCHRONOUS_NV;
         eglAttribs[3] = EGL_TRUE;
     }
@@ -582,7 +587,8 @@ static EGLint create_surface_stream_remote(WlEglSurface *surface,
         EGL_STREAM_PROTOCOL_NV,     EGL_STREAM_PROTOCOL_SOCKET_NV,
         EGL_SOCKET_TYPE_NV,         EGL_DONT_CARE,
         EGL_SOCKET_HANDLE_NV,       -1,
-        EGL_NONE
+        EGL_NONE,                   EGL_NONE,
+        EGL_NONE,
     };
     pthread_t  thread;
     int        socket[2];
@@ -672,6 +678,13 @@ static EGLint create_surface_stream_remote(WlEglSurface *surface,
     eglAttribs[7] = (useInet ? EGL_SOCKET_TYPE_INET_NV :
                                EGL_SOCKET_TYPE_UNIX_NV);
     eglAttribs[9] = socket[0];
+
+    if (!surface->isSurfaceProducer &&
+        display->wlStreamCtlVer >= WL_EGLSTREAM_CONTROLLER_ATTACH_EGLSTREAM_CONSUMER_ATTRIB_SINCE) {
+        eglAttribs[10] = EGL_STREAM_FIFO_LENGTH_KHR;
+        eglAttribs[11] = surface->fifoLength;
+    }
+
     surface->ctx.eglStream =
         data->egl.createStream(display->devDpy->eglDisplay, eglAttribs);
     if (surface->ctx.eglStream == EGL_NO_STREAM_KHR) {
@@ -748,10 +761,12 @@ create_surface_context(WlEglSurface *surface)
     struct wl_event_queue *queue       = NULL;
     EGLint                 synchronous = EGL_FALSE;
     EGLint                 err         = EGL_SUCCESS;
+    struct wl_array        wlAttribs;
+    intptr_t              *wlAttribsData;
 
     assert(surface->ctx.eglSurface == EGL_NO_SURFACE);
 
-    queue = wlGetEventQueue(display->nativeDpy);
+    queue = wlGetEventQueue(display);
     if (!queue) {
         err = EGL_BAD_ALLOC;
         goto fail;
@@ -772,10 +787,44 @@ create_surface_context(WlEglSurface *surface)
     /* Then attach the wl_eglstream so the compositor connects a consumer to the
      * EGLStream */
     if (display->wlStreamCtl != NULL) {
-        wl_eglstream_controller_attach_eglstream_consumer(
-                                                display->wlStreamCtl,
-                                                surface->wlSurface,
-                                                surface->ctx.wlStreamResource);
+        if (display->wlStreamCtlVer >=
+            WL_EGLSTREAM_CONTROLLER_ATTACH_EGLSTREAM_CONSUMER_ATTRIB_SINCE) {
+            wl_array_init(&wlAttribs);
+
+            if (!wl_array_add(&wlAttribs, 2 * sizeof(intptr_t))) {
+                wl_array_release(&wlAttribs);
+                err = EGL_BAD_ALLOC;
+                goto fail;
+            }
+
+            wlAttribsData = (intptr_t *)wlAttribs.data;
+            wlAttribsData[0] = WL_EGLSTREAM_CONTROLLER_ATTRIB_PRESENT_MODE;
+
+            if (surface->isSurfaceProducer) {
+                wlAttribsData[1] = WL_EGLSTREAM_CONTROLLER_PRESENT_MODE_DONT_CARE;
+            } else if (surface->fifoLength > 0) {
+                if (!wl_array_add(&wlAttribs, 2 * sizeof(intptr_t))) {
+                    wl_array_release(&wlAttribs);
+                    err = EGL_BAD_ALLOC;
+                    goto fail;
+                }
+                wlAttribsData    = (intptr_t *)wlAttribs.data;
+                wlAttribsData[1] = WL_EGLSTREAM_CONTROLLER_PRESENT_MODE_FIFO;
+                wlAttribsData[2] = WL_EGLSTREAM_CONTROLLER_ATTRIB_FIFO_LENGTH;
+                wlAttribsData[3] = surface->fifoLength;
+            } else {
+                wlAttribsData[1] = WL_EGLSTREAM_CONTROLLER_PRESENT_MODE_MAILBOX;
+            }
+
+            wl_eglstream_controller_attach_eglstream_consumer_attribs(display->wlStreamCtl,
+                                                                      surface->wlSurface,
+                                                                      surface->ctx.wlStreamResource,
+                                                                      &wlAttribs);
+        } else {
+            wl_eglstream_controller_attach_eglstream_consumer(display->wlStreamCtl,
+                                                              surface->wlSurface,
+                                                              surface->ctx.wlStreamResource);
+        }
     } else {
         wl_surface_attach(surface->wlSurface,
                           surface->ctx.wlStreamResource,
@@ -846,6 +895,8 @@ fail:
 
 EGLBoolean wlEglInitializeSurfaceExport(WlEglSurface *surface)
 {
+    WlEglDisplay *display = surface->wlEglDpy;
+
     wlExternalApiLock();
     wl_list_init(&surface->oldCtxList);
     wl_list_insert(&wlEglSurfaceList, &surface->link);
@@ -853,6 +904,10 @@ EGLBoolean wlEglInitializeSurfaceExport(WlEglSurface *surface)
         wlExternalApiUnlock();
         return EGL_FALSE;
     }
+
+    wl_eglstream_display_swap_interval(display->wlStreamDpy,
+                                       surface->ctx.wlStreamResource,
+                                       surface->swapInterval);
 
     wlExternalApiUnlock();
     return EGL_TRUE;
@@ -1028,19 +1083,24 @@ static EGLint destroyEglSurface(EGLDisplay dpy, EGLSurface eglSurface)
         // Force damage thread to exit before invalidating the window objects
         finish_wl_eglstream_damage_thread(surface, &surface->ctx, 1);
 
+        // We only expect a valid wlEglWin to be set when using
+        // a surface created with EGL_KHR_platform_wayland.
         if (wlEglIsWaylandDisplay(display->nativeDpy) &&
-            wlEglIsWaylandWindowValid(surface->wlEglWin)) {
-            queue = wlGetEventQueue(display->nativeDpy);
+           (wlEglIsWaylandWindowValid(surface->wlEglWin) ||
+           (!surface->isSurfaceProducer))) {
+            queue = wlGetEventQueue(display);
             if (queue != NULL) {
                 wl_surface_attach(surface->wlSurface, NULL, 0, 0);
                 wl_surface_commit(surface->wlSurface);
                 ret = wlEglRoundtrip(display, queue);
             }
 
-            surface->wlEglWin->driver_private = NULL;
-            surface->wlEglWin->resize_callback = NULL;
-            if (surface->wlEglWinVer >= WL_EGL_WINDOW_DESTROY_CALLBACK_SINCE) {
-                surface->wlEglWin->destroy_window_callback = NULL;
+            if (surface->isSurfaceProducer) {
+                surface->wlEglWin->driver_private = NULL;
+                surface->wlEglWin->resize_callback = NULL;
+                if (surface->wlEglWinVer >= WL_EGL_WINDOW_DESTROY_CALLBACK_SINCE) {
+                    surface->wlEglWin->destroy_window_callback = NULL;
+                }
             }
         }
 
@@ -1164,6 +1224,9 @@ EGLSurface wlEglCreatePlatformWindowSurfaceHook(EGLDisplay dpy,
     surface->ctx.eglSurface = EGL_NO_SURFACE;
     surface->ctx.isOffscreen = EGL_FALSE;
     surface->isSurfaceProducer = EGL_TRUE;
+    // FIFO_LENGTH == 1 to set FIFO mode, FIFO_LENGTH == 0 to set MAILBOX mode
+    surface->fifoLength = (display->exts.stream_fifo_synchronous &&
+                           display->exts.stream_sync) ? 1 : 0;
 
     getWlEglWindowVersionAndSurface(window,
                                     &surface->wlEglWinVer,
@@ -1215,6 +1278,9 @@ EGLSurface wlEglCreatePlatformPixmapSurfaceHook(EGLDisplay dpy,
                                                 const EGLAttrib *attribs)
 {
     WlEglDisplay *display = (WlEglDisplay*)dpy;
+    (void) config;
+    (void) nativePixmap;
+    (void) attribs;
 
     /* Wayland does not support pixmap types. See EGL_EXT_platform_wayland. */
     wlEglSetError(display->data, EGL_BAD_PARAMETER);

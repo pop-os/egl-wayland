@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014-2016, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2014-2018, NVIDIA CORPORATION. All rights reserved.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -33,6 +33,10 @@
 extern "C" {
 #endif
 
+/* This define represents the version of the wl_eglstream_controller interface
+   when the attach_eglstream_consumer_attrib() request was first available" */
+#define WL_EGLSTREAM_CONTROLLER_ATTACH_EGLSTREAM_CONSUMER_ATTRIB_SINCE 2
+
 typedef struct WlEglDeviceDpyRec {
     EGLDeviceEXT eglDevice;
     EGLDisplay   eglDisplay;
@@ -47,10 +51,12 @@ typedef struct WlEglDisplayRec {
 
     EGLBoolean         ownNativeDpy;
     struct wl_display *nativeDpy;
+    struct wl_list     evtQueueList;
 
     struct wl_registry             *wlRegistry;
     struct wl_eglstream_display    *wlStreamDpy;
     struct wl_eglstream_controller *wlStreamCtl;
+    unsigned int                    wlStreamCtlVer;
     struct {
         unsigned int stream_fd     : 1;
         unsigned int stream_inet   : 1;
@@ -74,6 +80,14 @@ typedef struct WlEglDisplayRec {
     EGLBoolean useRefCount;
     unsigned int refCount;
 } WlEglDisplay;
+
+typedef struct WlEventQueueRec {
+    WlEglDisplay          *display;
+    struct wl_event_queue *queue;
+
+    struct wl_list dpyLink;
+    struct wl_list threadLink;
+} WlEventQueue;
 
 EGLBoolean wlEglIsValidNativeDisplayExport(void *data, void *nativeDpy);
 EGLBoolean wlEglBindDisplaysHook(void *data, EGLDisplay dpy, void *nativeDpy);
@@ -104,7 +118,7 @@ const char* wlEglQueryStringExport(void *data,
                                    EGLDisplay dpy,
                                    EGLExtPlatformString name);
 
-struct wl_event_queue* wlGetEventQueue(struct wl_display *display);
+struct wl_event_queue* wlGetEventQueue(WlEglDisplay *display);
 int wlEglRoundtrip(WlEglDisplay *display, struct wl_event_queue *queue);
 
 #ifdef __cplusplus
