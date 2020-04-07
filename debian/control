@@ -2,7 +2,7 @@ Source: egl-wayland
 Priority: optional
 Maintainer: Timo Aaltonen <tjaalton@debian.org>
 Build-Depends:
- debhelper (>= 11),
+ debhelper-compat (= 12),
  eglexternalplatform-dev,
  libegl1-mesa-dev,
  libwayland-dev,
