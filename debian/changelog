@@ -4,6 +4,7 @@ egl-wayland (1:1.1.4-1) UNRELEASED; urgency=medium
   * add-missing-definitions.patch: Fix build with current mesa.
     (Closes: #951936)
   * control: Use debhelper-compat, bump to 12.
+  * control: Bump policy to 4.5.0.
 
  -- Timo Aaltonen <tjaalton@debian.org>  Tue, 07 Apr 2020 06:34:05 +0300
 
