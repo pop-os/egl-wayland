@@ -1,4 +1,4 @@
-egl-wayland (1:1.1.4-1) UNRELEASED; urgency=medium
+egl-wayland (1:1.1.4-1) unstable; urgency=medium
 
   * New upstream release.
   * add-missing-definitions.patch: Fix build with current mesa.
@@ -6,7 +6,7 @@ egl-wayland (1:1.1.4-1) UNRELEASED; urgency=medium
   * control: Use debhelper-compat, bump to 12.
   * control: Bump policy to 4.5.0.
 
- -- Timo Aaltonen <tjaalton@debian.org>  Tue, 07 Apr 2020 06:34:05 +0300
+ -- Timo Aaltonen <tjaalton@debian.org>  Tue, 07 Apr 2020 06:39:03 +0300
 
 egl-wayland (1:1.1.2-1) unstable; urgency=medium
 
