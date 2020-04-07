@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014-2018, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2014-2019, NVIDIA CORPORATION. All rights reserved.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -35,11 +35,11 @@ extern "C" {
 #endif
 
 typedef struct WlEglSurfaceCtxRec {
-    EGLBoolean    isOffscreen;
-    EGLSurface    eglSurface;
-    EGLStreamKHR  eglStream;
-    void         *wlStreamResource;
-    EGLBoolean    isAttached;
+    EGLBoolean              isOffscreen;
+    EGLSurface              eglSurface;
+    EGLStreamKHR            eglStream;
+    void                   *wlStreamResource;
+    EGLBoolean              isAttached;
 
     int          useDamageThread;
     pthread_t    damageThreadId;
@@ -57,6 +57,7 @@ typedef struct WlEglSurfaceRec {
     WlEglDisplay *wlEglDpy;
     EGLConfig     eglConfig;
     EGLint       *attribs;
+    EGLBoolean    pendingSwapIntervalUpdate;
 
     struct wl_egl_window *wlEglWin;
     long int              wlEglWinVer;
@@ -71,10 +72,27 @@ typedef struct WlEglSurfaceRec {
     EGLint fifoLength;
 
     struct wl_callback    *throttleCallback;
+    struct wl_event_queue *wlEventQueue;
 
     struct wl_list link;
 
     EGLBoolean isSurfaceProducer;
+
+    /* The refCount is initialized to 1 during EGLSurface creation,
+     * gets incremented/decrementsd in wlEglSurfaceRef()/wlEglSurfaceUnref(),
+     * when we enter/exit from eglSwapBuffers().
+     */
+    unsigned int refCount;
+    /*
+     * Set to EGL_TRUE before destroying the EGLSurface in eglDestroySurface().
+     */
+    EGLBoolean isDestroyed;
+
+    /* The lock is used to serialize eglSwapBuffers()/eglDestroySurface(),
+     * Using wlExternalApiLock() for this requires that we release lock
+     * before dispatching frame sync events in wlEglWaitFrameSync().
+     */
+    pthread_mutex_t mutexLock;
 } WlEglSurface;
 
 extern struct wl_list wlEglSurfaceList;
@@ -111,8 +129,12 @@ EGLBoolean wlEglQueryNativeResourceHook(EGLDisplay dpy,
 EGLBoolean wlEglSendDamageEvent(WlEglSurface *surface,
                                 struct wl_event_queue *queue);
 
-void wlEglCreateFrameSync(WlEglSurface *surface, struct wl_event_queue *queue);
-EGLint wlEglWaitFrameSync(WlEglSurface *surface, struct wl_event_queue *queue);
+void wlEglCreateFrameSync(WlEglSurface *surface);
+EGLint wlEglWaitFrameSync(WlEglSurface *surface);
+
+EGLBoolean wlEglSurfaceRef(WlEglSurface *surface);
+void wlEglSurfaceUnref(WlEglSurface *surface);
+
 #ifdef __cplusplus
 }
 #endif

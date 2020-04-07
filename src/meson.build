@@ -7,6 +7,7 @@ endif
 add_project_arguments('-Wall', language : 'c')
 add_project_arguments('-Werror', language : 'c')
 add_project_arguments('-fvisibility=hidden', language : 'c')
+add_project_arguments('-DWL_HIDE_DEPRECATED', language : 'c')
 add_project_link_arguments('-Wl,-Bsymbolic', language : 'c')
 
 if cc.has_argument('-Wpedantic')
@@ -15,6 +16,7 @@ endif
 
 src = [
     'wayland-thread.c',
+    'wayland-egldevice.c',
     'wayland-egldisplay.c',
     'wayland-eglstream.c',
     'wayland-eglstream-server.c',

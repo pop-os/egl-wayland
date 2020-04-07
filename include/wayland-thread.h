@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016-2018, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2016-2019, NVIDIA CORPORATION. All rights reserved.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -24,6 +24,8 @@
 #define WAYLAND_THREAD_H
 
 #include <wayland-client.h>
+#include <pthread.h>
+#include <stdbool.h>
 
 /*
  * wlExternalApiLock()
@@ -62,26 +64,17 @@ int wlExternalApiUnlock(void);
 void wlExternalApiDestroyLock(void);
 
 /*
- * WlThread structure
+ * wlEglInitializeMutex(pthread_mutex_t *mutex)
  *
- * Keeps all thread-specific data required by the Wayland external platform
- * implementation to manage resources relevant to multi-threaded environments.
+ * Initialises the pthread mutex referenced by mutex.
  */
-typedef struct WlThreadRec {
-    struct wl_list evtQueueList;
-} WlThread;
-
+bool wlEglInitializeMutex(pthread_mutex_t *mutex);
 
 /*
- * wlEglGetThread()
+ * wlEglMutexDestroy(pthread_mutex_t *mutex)
  *
- * Returns the current thread's WlThread storage. If it doesn't exist yet, it
- * creates it. Callers don't need to worry about destroying the returned storage
- * data since proper global destructors are set up.
- *
- * Returns a pointer to the thread's WlThread storage upon success; otherwise,
- * returns NULL.
+ * Destroys the pthread mutex referenced by mutex.
  */
-WlThread* wlGetThread(void);
+void wlEglMutexDestroy(pthread_mutex_t *mutex);
 
 #endif

@@ -2,7 +2,7 @@ AC_PREREQ([2.64])
 
 m4_define([wayland_eglstream_major_version], [1])
 m4_define([wayland_eglstream_minor_version], [1])
-m4_define([wayland_eglstream_micro_version], [2])
+m4_define([wayland_eglstream_micro_version], [4])
 m4_define([wayland_eglstream_version],
           [wayland_eglstream_major_version.wayland_eglstream_minor_version.wayland_eglstream_micro_version])
 
@@ -78,13 +78,15 @@ AC_CHECK_FUNCS([getpagesize inet_ntoa memset socket strcasecmp strstr])
 
 # See if the compiler supports the -fvisibility=hidden flag.
 AX_CHECK_COMPILE_FLAG([-fvisibility=hidden],
-      [AC_SUBST([COMPILER_FLAG_VISIBILITY_HIDDEN], ["-fvisibility=hidden"])],
-      [AC_SUBST([COMPILER_FLAG_VISIBILITY_HIDDEN], [""])])
+      [COMPILER_FLAG_VISIBILITY_HIDDEN="-fvisibility=hidden"],
+      [COMPILER_FLAG_VISIBILITY_HIDDEN=""])
+AC_SUBST([COMPILER_FLAG_VISIBILITY_HIDDEN])
 
 # See if the linker supports the --no-undefined flag.
 AX_CHECK_LINK_FLAG([-Xlinker --no-undefined],
-      [AC_SUBST([LINKER_FLAG_NO_UNDEFINED], ["-Xlinker --no-undefined"])],
-      [AC_SUBST([LINKER_FLAG_NO_UNDEFINED], [""])])
+      [LINKER_FLAG_NO_UNDEFINED="-Xlinker --no-undefined"],
+      [LINKER_FLAG_NO_UNDEFINED=""])
+AC_SUBST([LINKER_FLAG_NO_UNDEFINED])
 
 # Default CFLAGS
 CFLAGS="$CFLAGS -Wall -Werror -include config.h"

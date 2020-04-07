@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014-2018, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2014-2019, NVIDIA CORPORATION. All rights reserved.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -27,6 +27,7 @@
 #include "wayland-eglsurface.h"
 #include "wayland-eglhandle.h"
 #include "wayland-eglutils.h"
+#include <assert.h>
 #include <wayland-egl-backend.h>
 
 EGLBoolean wlEglSwapBuffersHook(EGLDisplay eglDisplay, EGLSurface eglSurface)
@@ -38,44 +39,62 @@ EGLBoolean wlEglSwapBuffersWithDamageHook(EGLDisplay eglDisplay, EGLSurface eglS
 {
     WlEglDisplay          *display     = (WlEglDisplay *)eglDisplay;
     WlEglPlatformData     *data        = display->data;
-    WlEglSurface          *surface     = (WlEglSurface *)eglSurface;
-    struct wl_event_queue *queue       = NULL;
+    WlEglSurface          *surface     = NULL;
     EGLStreamKHR           eglStream   = EGL_NO_STREAM_KHR;
     EGLBoolean             isOffscreen = EGL_FALSE;
     EGLBoolean             res;
     EGLint                 err;
 
-    wlExternalApiLock();
-
-    if (!wlEglIsWaylandDisplay(display->nativeDpy)) {
-        err = EGL_BAD_DISPLAY;
+    if (display->initCount == 0) {
+        err = EGL_NOT_INITIALIZED;
         goto fail;
     }
 
-    if (!wlEglIsWlEglSurface(surface)) {
+    //wlEglSurfaceRef() requires we acquire wlExternalApiLock.
+    wlExternalApiLock();
+    if (!wlEglSurfaceRef(eglSurface)) {
+        wlExternalApiUnlock();
         err = EGL_BAD_SURFACE;
         goto fail;
     }
 
+    surface = eglSurface;
+    if (surface->pendingSwapIntervalUpdate == EGL_TRUE) {
+        /* Send request from client to override swapinterval value based on
+         * server's swapinterval for overlay compositing
+         */
+        wl_eglstream_display_swap_interval(display->wlStreamDpy,
+                                           surface->ctx.wlStreamResource,
+                                           surface->swapInterval);
+        /* For receiving any event in case of override */
+        if (wl_display_roundtrip_queue(display->nativeDpy,
+                                       display->wlEventQueue) < 0) {
+            err = EGL_BAD_ALLOC;
+            wlExternalApiUnlock();
+            goto fail;
+        }
+        surface->pendingSwapIntervalUpdate = EGL_FALSE;
+    }
+
+    wlExternalApiUnlock();
+
+
+    // Acquire wlEglSurface lock.
+    pthread_mutex_lock(&surface->mutexLock);
+
+    if (surface->isDestroyed) {
+        err = EGL_BAD_SURFACE;
+        goto fail_locked;
+    }
+
     isOffscreen = surface->ctx.isOffscreen;
-
     if (!isOffscreen) {
-        queue = wlGetEventQueue(display);
-        if (queue == NULL) {
-            err = EGL_CONTEXT_LOST; /* XXX: Is this the right error? */
-            goto fail;
-        }
-
         if (!wlEglIsWaylandWindowValid(surface->wlEglWin)) {
-            err = EGL_BAD_SURFACE;
-            goto fail;
+            err = EGL_BAD_NATIVE_WINDOW;
+            goto fail_locked;
         }
 
-        /* Bail out if we were left with an invalid surface */
-        if (wlEglWaitFrameSync(surface, queue) == EGL_BAD_SURFACE) {
-            err = EGL_BAD_SURFACE;
-            goto fail;
-        }
+        wlEglWaitFrameSync(surface);
     }
 
     /* Save the internal EGLDisplay, EGLSurface and EGLStream handles, as
@@ -87,7 +106,6 @@ EGLBoolean wlEglSwapBuffersWithDamageHook(EGLDisplay eglDisplay, EGLSurface eglS
     /* eglSwapBuffers() is a blocking call. We must release the lock so other
      * threads using the external platform are allowed to progress.
      */
-    wlExternalApiUnlock();
     if (rects) {
         res = data->egl.swapBuffersWithDamage(eglDisplay, eglSurface, rects, n_rects);
     } else {
@@ -96,32 +114,38 @@ EGLBoolean wlEglSwapBuffersWithDamageHook(EGLDisplay eglDisplay, EGLSurface eglS
     if (isOffscreen) {
         goto done;
     }
-    if (display->exts.stream_flush) {
+    if (display->devDpy->exts.stream_flush) {
         data->egl.streamFlush(eglDisplay, eglStream);
-    }
-    wlExternalApiLock();
-
-    /* Bail out if the surface was destroyed while the lock was suspended */
-    if (!wlEglIsWlEglSurface(surface)) {
-        err = EGL_BAD_SURFACE;
-        goto fail;
     }
 
     if (res) {
         if (surface->ctx.useDamageThread) {
             surface->ctx.framesProduced++;
         } else {
-            res = wlEglSendDamageEvent(surface, queue);
+            res = wlEglSendDamageEvent(surface, surface->wlEventQueue);
         }
     }
-    wlEglCreateFrameSync(surface, queue);
-    wlExternalApiUnlock();
+    wlEglCreateFrameSync(surface);
 
 done:
+    // Release wlEglSurface lock.
+    pthread_mutex_unlock(&surface->mutexLock);
+
+    //wlEglSurfaceUnRef() requires we acquire wlExternalApiLock.
+    wlExternalApiLock();
+    wlEglSurfaceUnref(surface);
+    wlExternalApiUnlock();
     return res;
 
+fail_locked:
+    pthread_mutex_unlock(&surface->mutexLock);
 fail:
-    wlExternalApiUnlock();
+    if (surface != NULL) {
+        //wlEglSurfaceUnRef() requires we acquire wlExternalApiLock.
+        wlExternalApiLock();
+        wlEglSurfaceUnref(surface);
+        wlExternalApiUnlock();
+    }
     wlEglSetError(data, err);
     return EGL_FALSE;
 }
@@ -160,12 +184,13 @@ EGLBoolean wlEglSwapIntervalHook(EGLDisplay eglDisplay, EGLint interval)
         goto done;
     }
 
-    wl_eglstream_display_swap_interval(display->wlStreamDpy,
-                                       surface->ctx.wlStreamResource,
-                                       interval);
-
     /* Cache interval value so we can reset it upon surface reattach */
     surface->swapInterval = interval;
+
+    /* Set client's pendingSwapIntervalUpdate for updating client's
+     * swapinterval
+     */
+    surface->pendingSwapIntervalUpdate = EGL_TRUE;
 
 done:
     wlExternalApiUnlock();
@@ -174,19 +199,33 @@ done:
 }
 
 EGLBoolean wlEglPrePresentExport(WlEglSurface *surface) {
-    WlEglDisplay          *display = surface->wlEglDpy;
-    struct wl_event_queue *queue   = NULL;
 
     wlExternalApiLock();
-
-    queue = wlGetEventQueue(display);
-    if (queue == NULL) {
-        return EGL_FALSE;
+    if (surface->pendingSwapIntervalUpdate == EGL_TRUE) {
+        /* Send request from client to override swapinterval value based on
+         * server's swapinterval for overlay compositing
+         */
+        wl_eglstream_display_swap_interval(surface->wlEglDpy->wlStreamDpy,
+                                           surface->ctx.wlStreamResource,
+                                           surface->swapInterval);
+        /* For receiving any event in case of override */
+        if (wl_display_roundtrip_queue(surface->wlEglDpy->nativeDpy,
+                                       surface->wlEglDpy->wlEventQueue) < 0) {
+            wlExternalApiUnlock();
+            return EGL_FALSE;
+        }
+        surface->pendingSwapIntervalUpdate = EGL_FALSE;
     }
 
-    wlEglWaitFrameSync(surface, queue);
-
     wlExternalApiUnlock();
+
+    // Acquire wlEglSurface lock.
+    pthread_mutex_lock(&surface->mutexLock);
+
+    wlEglWaitFrameSync(surface);
+
+    // Release wlEglSurface lock.
+    pthread_mutex_unlock(&surface->mutexLock);
 
     return EGL_TRUE;
 }
@@ -194,29 +233,27 @@ EGLBoolean wlEglPrePresentExport(WlEglSurface *surface) {
 EGLBoolean wlEglPostPresentExport(WlEglSurface *surface) {
     WlEglDisplay          *display = surface->wlEglDpy;
     WlEglPlatformData     *data    = display->data;
-    struct wl_event_queue *queue   = NULL;
     EGLBoolean             res     = EGL_TRUE;
 
-    if (display->exts.stream_flush) {
+    // Acquire wlEglSurface lock.
+    pthread_mutex_lock(&surface->mutexLock);
+
+    if (display->devDpy->exts.stream_flush) {
         data->egl.streamFlush((EGLDisplay) display, surface->ctx.eglStream);
     }
 
-    wlExternalApiLock();
-
-    queue = wlGetEventQueue(display);
-    if (queue == NULL) {
-        return EGL_FALSE;
-    }
 
     if (surface->ctx.useDamageThread) {
         surface->ctx.framesProduced++;
     } else {
-        res = wlEglSendDamageEvent(surface, queue);
+        res = wlEglSendDamageEvent(surface, surface->wlEventQueue);
     }
 
-    wlEglCreateFrameSync(surface, queue);
+    wlEglCreateFrameSync(surface);
 
-    wlExternalApiUnlock();
+    // Release wlEglSurface lock.
+    pthread_mutex_unlock(&surface->mutexLock);
+
 
     return res;
 }

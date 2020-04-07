@@ -74,7 +74,7 @@ handle_create_stream(struct wl_client *client,
     struct wl_eglstream_display *wlStreamDpy =
         wl_resource_get_user_data(resource);
     struct wl_eglstream *wlStream;
-    struct sockaddr_in sockAddr = { 0 };
+    struct sockaddr_in sockAddr;
     char sockAddrStr[NI_MAXHOST];
     intptr_t *attr;
     int mask = 0;
@@ -91,6 +91,9 @@ handle_create_stream(struct wl_client *client,
     wlStream->width = width;
     wlStream->height = height;
     wlStream->handle = -1;
+    wlStream->yInverted = EGL_FALSE;
+
+    memset(&sockAddr, 0, sizeof(sockAddr));
 
     switch (handle_type) {
         case WL_EGLSTREAM_HANDLE_TYPE_FD:
@@ -134,6 +137,16 @@ handle_create_stream(struct wl_client *client,
                 }
                 sockAddr.sin_port = htons((int)attr[1]);
                 mask |= MASK(WL_EGLSTREAM_ATTRIB_INET_PORT);
+                break;
+
+            case WL_EGLSTREAM_ATTRIB_Y_INVERTED:
+                /* Y_INVERTED should only be set once */
+                if (mask & MASK(WL_EGLSTREAM_ATTRIB_Y_INVERTED)) {
+                    err = WL_EGLSTREAM_ERROR_BAD_ATTRIBS;
+                    goto error_create_stream;
+                }
+                wlStream->yInverted = (EGLBoolean)attr[1];
+                mask |= MASK(WL_EGLSTREAM_ATTRIB_Y_INVERTED);
                 break;
 
             default:
@@ -285,7 +298,7 @@ wl_eglstream_display_bind(WlEglPlatformData *data,
         return EGL_FALSE;
     }
 
-    wlStreamDpy = malloc(sizeof(*wlStreamDpy));
+    wlStreamDpy = calloc(1, sizeof(*wlStreamDpy));
     if (!wlStreamDpy) {
         return EGL_FALSE;
     }
@@ -307,6 +320,7 @@ wl_eglstream_display_bind(WlEglPlatformData *data,
     CACHE_EXT(NV,  stream_socket);
     CACHE_EXT(NV,  stream_socket_inet);
     CACHE_EXT(NV,  stream_socket_unix);
+    CACHE_EXT(NV,  stream_origin);
 
 #undef CACHE_EXT
 

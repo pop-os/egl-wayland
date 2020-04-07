@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2016-2019, NVIDIA CORPORATION. All rights reserved.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -27,17 +27,20 @@
 
 #include "wayland-thread.h"
 #include "wayland-egldisplay.h"
-#include <pthread.h>
 #include <stdlib.h>
 #include <assert.h>
+
+#if defined(__QNX__)
+#define WL_EGL_ATTRIBUTE_DESTRUCTOR
+#define WL_EGL_ATEXIT(func) atexit(func)
+#else
+#define WL_EGL_ATTRIBUTE_DESTRUCTOR __attribute__((destructor))
+#define WL_EGL_ATEXIT(func) 0
+#endif
 
 static pthread_mutex_t wlMutex;
 static pthread_once_t  wlMutexOnceControl = PTHREAD_ONCE_INIT;
 static int             wlMutexInitialized = 0;
-
-static pthread_key_t   wlTLSKey;
-static pthread_once_t  wlTLSKeyOnceControl = PTHREAD_ONCE_INIT;
-static int             wlTLSKeyInitialized = 0;
 
 static void wlExternalApiInitializeLock(void)
 {
@@ -98,64 +101,31 @@ int wlExternalApiUnlock(void)
     return 0;
 }
 
-static void destroy_tls_key(void *data)
+bool wlEglInitializeMutex(pthread_mutex_t *mutex)
 {
-    WlThread     *wlThread = data;
-    WlEventQueue *iter     = NULL;
-    WlEventQueue *tmp      = NULL;
+    pthread_mutexattr_t attr;
+    bool ret = true;
 
-    if (wlThread) {
-        /* Invalidate and destroy all queues */
-        wl_list_for_each_safe(iter, tmp, &wlThread->evtQueueList, threadLink) {
-            if (iter->queue != NULL) {
-                wl_event_queue_destroy(iter->queue);
-                wl_list_remove(&iter->dpyLink);
-            }
-            wl_list_remove(&iter->threadLink);
-            free(iter);
-        }
-
-        free(wlThread);
+    if (pthread_mutexattr_init(&attr)) {
+        return false;
     }
+
+    if (pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_ERRORCHECK)) {
+        ret = false;
+        goto done;
+    }
+
+    if (pthread_mutex_init(mutex, &attr)) {
+        ret = false;
+        goto done;
+    }
+
+done:
+    pthread_mutexattr_destroy(&attr);
+    return ret;
 }
 
-static void create_tls_key(void)
+void wlEglMutexDestroy(pthread_mutex_t *mutex)
 {
-    /* Create a pthread storage key to be used to set and retrieave TLS data */
-    if (pthread_key_create(&wlTLSKey, destroy_tls_key) == 0) {
-        wlTLSKeyInitialized = 1;
-    }
-}
-
-WlThread* wlGetThread(void)
-{
-    WlThread *wlThread = NULL;
-
-    if (pthread_once(&wlTLSKeyOnceControl, create_tls_key)) {
-        assert(!"pthread once failed");
-        return NULL;
-    }
-
-    if (!wlTLSKeyInitialized) {
-        assert(!"failed to create TLS key");
-        return NULL;
-    }
-
-    wlThread = pthread_getspecific(wlTLSKey);
-    if (wlThread == NULL) {
-        wlThread = calloc(1, sizeof(WlThread));
-        if (wlThread == NULL) {
-            return NULL;
-        }
-
-        if (pthread_setspecific(wlTLSKey, wlThread) != 0) {
-            assert(!"failed to set TLS data");
-            free(wlThread);
-            return NULL;
-        }
-
-        wl_list_init(&wlThread->evtQueueList);
-    }
-
-    return wlThread;
+    pthread_mutex_destroy(mutex);
 }

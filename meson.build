@@ -1,12 +1,12 @@
 project('wayland-eglstream', 'c',
-        version : '1.1.2',
+        version : '1.1.4',
         default_options : [
           'buildtype=debugoptimized',
           'c_std=gnu99',
           'warning_level=1',
         ],
         license : 'MIT',
-        meson_version : '>= 0.43'
+        meson_version : '>= 0.50'
 )
 
 cc = meson.get_compiler('c')
