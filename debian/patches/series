@@ -1,1 +1,2 @@
+add-missing-definitions.patch
 fix-pkgconfig-target.diff
