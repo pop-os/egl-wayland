@@ -315,6 +315,8 @@ destroy_surface_context(WlEglSurface *surface, WlEglSurfaceCtx *ctx)
     EGLStreamKHR       stream   = ctx->eglStream;
     void              *resource = ctx->wlStreamResource;
 
+    finish_wl_eglstream_damage_thread(surface, ctx, 1);
+
     ctx->eglSurface       = EGL_NO_SURFACE;
     ctx->eglStream        = EGL_NO_STREAM_KHR;
     ctx->wlStreamResource = NULL;
@@ -331,8 +333,6 @@ destroy_surface_context(WlEglSurface *surface, WlEglSurfaceCtx *ctx)
         data->egl.destroyStream(dpy, stream);
         ctx->eglStream = EGL_NO_STREAM_KHR;
     }
-
-    finish_wl_eglstream_damage_thread(surface, ctx, 1);
 
     if (resource) {
         wl_buffer_destroy(resource);
@@ -1107,7 +1107,6 @@ static EGLBoolean wlEglDestroySurface(EGLDisplay dpy, EGLSurface eglSurface)
     WlEglSurfaceCtx       *next    = NULL;
 
     if (!wlEglIsWlEglSurface(surface) || display != surface->wlEglDpy) {
-        wlEglSetError(display->data, EGL_BAD_SURFACE);
         return EGL_FALSE;
     }
 
@@ -1460,13 +1459,16 @@ EGLBoolean wlEglDestroySurfaceHook(EGLDisplay dpy, EGLSurface eglSurface)
 
     if (display->initCount == 0) {
         wlEglSetError(display->data, EGL_NOT_INITIALIZED);
-        wlExternalApiUnlock();
-        return EGL_FALSE;
+        goto done;
     }
 
     ret = wlEglDestroySurface(dpy, eglSurface);
-    wlExternalApiUnlock();
+    if (!ret) {
+        wlEglSetError(display->data, EGL_BAD_SURFACE);
+    }
 
+done:
+    wlExternalApiUnlock();
     return ret;
 }
 
