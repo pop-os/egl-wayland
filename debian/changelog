@@ -1,9 +1,9 @@
-egl-wayland (1:1.1.5-1) UNRELEASED; urgency=medium
+egl-wayland (1:1.1.5-1) unstable; urgency=medium
 
   * New upstream release.
   * add-missing-definitions.patch: Dropped, upstream.
 
- -- Timo Aaltonen <tjaalton@debian.org>  Mon, 31 Aug 2020 10:04:46 +0300
+ -- Timo Aaltonen <tjaalton@debian.org>  Tue, 01 Dec 2020 16:44:29 +0200
 
 egl-wayland (1:1.1.4-1) unstable; urgency=medium
 
