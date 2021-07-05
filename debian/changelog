@@ -2,6 +2,7 @@ egl-wayland (1:1.1.7-1) UNRELEASED; urgency=medium
 
   * New upstream release.
   * fix-pkgconfig-target.diff: Dropped, upstream.
+  * install: Updated.
 
  -- Timo Aaltonen <tjaalton@debian.org>  Mon, 05 Jul 2021 13:35:42 +0300
 
