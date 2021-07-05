@@ -40,6 +40,7 @@
 #include "wayland-eglstream.h"
 #include "wayland-eglswap.h"
 #include "wayland-eglutils.h"
+#include "wayland-thread.h"
 
 #define MASK(_VAL_) (1 << (_VAL_))
 
@@ -308,7 +309,9 @@ wl_eglstream_display_bind(WlEglPlatformData *data,
     wlStreamDpy->eglDisplay    = eglDisplay;
     wlStreamDpy->caps_override = 0;
 
+    wlExternalApiUnlock();
     exts = data->egl.queryString(eglDisplay, EGL_EXTENSIONS);
+    wlExternalApiLock();
 
 #define CACHE_EXT(_PREFIX_, _NAME_)                                      \
         wlStreamDpy->exts._NAME_ =                                       \
