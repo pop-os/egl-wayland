@@ -2,7 +2,7 @@ AC_PREREQ([2.64])
 
 m4_define([wayland_eglstream_major_version], [1])
 m4_define([wayland_eglstream_minor_version], [1])
-m4_define([wayland_eglstream_micro_version], [7])
+m4_define([wayland_eglstream_micro_version], [8])
 m4_define([wayland_eglstream_version],
           [wayland_eglstream_major_version.wayland_eglstream_minor_version.wayland_eglstream_micro_version])
 
@@ -51,15 +51,16 @@ fi
 AM_CONDITIONAL([WAYLAND_SCANNER_HAS_PRIVATE_CODE],
                [test x$WAYLAND_SCANNER = x`$PKG_CONFIG --variable=wayland_scanner "wayland-scanner >= 1.14.91"`])
 
+# Check for protocols.
+PKG_CHECK_MODULES(WAYLAND_PROTOCOLS, [wayland-protocols >= 1.8])
+AC_SUBST(WAYLAND_PROTOCOLS_DATADIR, `$PKG_CONFIG --variable=pkgdatadir wayland-protocols`)
+
 # Initialize libtool
 LT_PREREQ([2.2])
 LT_INIT
 
 # Checks for libraries.
 AX_PTHREAD()
-AC_CHECK_LIB([dl], [dlsym],
-             [],
-             [AC_MSG_ERROR("dlsym is needed to compile wayland-external")])
 PKG_CHECK_MODULES([EGL_EXTERNAL_PLATFORM], [eglexternalplatform >= ${EGL_EXTERNAL_PLATFORM_MIN_VERSION} eglexternalplatform < ${EGL_EXTERNAL_PLATFORM_MAX_VERSION}])
 PKG_CHECK_MODULES([WAYLAND], [wayland-server wayland-client wayland-egl-backend >= 3])
 

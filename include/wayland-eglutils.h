@@ -36,14 +36,13 @@
         wlEglSetErrorCallback(data, err, __FILE__, __LINE__)
 #endif
 
-#ifndef WL_LIST_INIT
-#define WL_LIST_INIT(head) { .prev = (head), .next = (head) }
+#ifndef WL_LIST_INITIALIZER
+#define WL_LIST_INITIALIZER(head) { .prev = (head), .next = (head) }
 #endif
 
-#if defined(__QNX__)
-#define HAS_MINCORE 0
-#else
-#define HAS_MINCORE 1
+#ifndef WL_LIST_INIT
+#define WL_LIST_INIT(head)                                      \
+    do { (head)->prev = (head)->next = (head); } while (0);
 #endif
 
 #ifdef __cplusplus
@@ -51,15 +50,8 @@ extern "C" {
 #endif
 
 EGLBoolean wlEglFindExtension(const char *extension, const char *extensions);
-#if HAS_MINCORE
-EGLBoolean wlEglPointerIsDereferencable(void *p);
+EGLBoolean wlEglMemoryIsReadable(const void *p, size_t len);
 EGLBoolean wlEglCheckInterfaceType(struct wl_object *obj, const char *ifname);
-#ifndef WL_CHECK_INTERFACE_TYPE
-#define WL_CHECK_INTERFACE_TYPE(obj, ifname)                            \
-    (wlEglCheckInterfaceType((struct wl_object *)(obj), #ifname) ||     \
-     *(void **)(obj) == &ifname)
-#endif
-#endif
 void wlEglSetErrorCallback(WlEglPlatformData *data,
                            EGLint err,
                            const char *file,

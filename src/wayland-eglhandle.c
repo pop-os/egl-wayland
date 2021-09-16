@@ -112,6 +112,16 @@ wlEglCreatePlatformData(int apiMajor, int apiMinor, const EGLExtDriver *driver)
 
     GET_PROC(queryDisplayAttrib,          eglQueryDisplayAttribKHR);
 
+    /* EGLImage Stream consumer and dependencies */
+    GET_PROC(streamImageConsumerConnect,  eglStreamImageConsumerConnectNV);
+    GET_PROC(streamAcquireImage,          eglStreamAcquireImageNV);
+    GET_PROC(streamReleaseImage,          eglStreamReleaseImageNV);
+    GET_PROC(queryStreamConsumerEvent,    eglQueryStreamConsumerEventNV);
+    GET_PROC(exportDMABUFImage,           eglExportDMABUFImageMESA);
+    GET_PROC(exportDMABUFImageQuery,      eglExportDMABUFImageQueryMESA);
+    GET_PROC(createImage,                 eglCreateImageKHR);
+    GET_PROC(destroyImage,                eglDestroyImageKHR);
+
 #undef GET_PROC
 
     /* Check for required EGL client extensions */
@@ -143,22 +153,24 @@ void wlEglDestroyPlatformData(WlEglPlatformData *data)
 
 void* wlEglGetInternalHandleExport(EGLDisplay dpy, EGLenum type, void *handle)
 {
-    wlExternalApiLock();
-
-    if ((type == EGL_OBJECT_DISPLAY_KHR) &&
-        wlEglIsWlEglDisplay((WlEglDisplay *)handle)) {
-        handle = (void *)(((WlEglDisplay *)handle)->devDpy->eglDisplay);
-    } else if ((type == EGL_OBJECT_SURFACE_KHR) &&
-               wlEglIsWlEglSurface((WlEglSurface *)handle)) {
-        WlEglSurface *surface = (WlEglSurface *)handle;
-        if (dpy == surface->wlEglDpy) {
-            handle = (void *)(surface->ctx.eglSurface);
-        } else {
-            handle = NULL;
+    WlEglDisplay *display;
+    if (type == EGL_OBJECT_DISPLAY_KHR) {
+        display = wlEglAcquireDisplay(handle);
+        if (display) {
+            handle = (void *)display->devDpy->eglDisplay;
+            wlEglReleaseDisplay(display);
+        }
+    } else if (type == EGL_OBJECT_SURFACE_KHR) {
+        display = wlEglAcquireDisplay(dpy);
+        if (display) {
+            pthread_mutex_lock(&display->mutex);
+            if (wlEglIsWlEglSurfaceForDisplay(display, (WlEglSurface *)handle)) {
+                handle = (void *)(((WlEglSurface *)handle)->ctx.eglSurface);
+            }
+            pthread_mutex_unlock(&display->mutex);
+            wlEglReleaseDisplay(dpy);
         }
     }
-
-    wlExternalApiUnlock();
 
     return handle;
 }

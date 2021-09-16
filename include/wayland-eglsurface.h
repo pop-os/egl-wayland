@@ -34,6 +34,24 @@
 extern "C" {
 #endif
 
+typedef struct WlEglStreamImageRec {
+    /* Pointer back to the parent surface for use in Wayland callbacks */
+    struct WlEglSurfaceRec *surface;
+
+    /*
+     * Use an individual mutex to guard access to each image's data. This avoids
+     * sharing the surface lock between the app and buffer release event
+     * threads, resulting in simplified lock management and smaller critical
+     * sections.
+     */
+    pthread_mutex_t         mutex;
+
+    EGLImageKHR             eglImage;
+    struct wl_buffer       *buffer;
+    EGLBoolean              attached;
+    struct wl_list          acquiredLink;
+} WlEglStreamImage;
+
 typedef struct WlEglSurfaceCtxRec {
     EGLBoolean              isOffscreen;
     EGLSurface              eglSurface;
@@ -49,6 +67,16 @@ typedef struct WlEglSurfaceCtxRec {
     EGLuint64KHR framesProduced;
     EGLuint64KHR framesFinished;
     EGLuint64KHR framesProcessed;
+
+    /*
+     * The double pointer is because of the need to allocate the data for each
+     * image slot separately to avoid clobbering the acquiredLink member
+     * whenever the streamImages arrary is resized with realloc().
+     */
+    WlEglStreamImage      **streamImages;
+    struct wl_list          acquiredImages;
+    struct wl_buffer       *currentBuffer;
+    uint32_t                numStreamImages;
 
     struct wl_list link;
 } WlEglSurfaceCtx;
@@ -74,6 +102,13 @@ typedef struct WlEglSurfaceRec {
     struct wl_callback    *throttleCallback;
     struct wl_event_queue *wlEventQueue;
 
+    /* Asynchronous wl_buffer.release event processing */
+    struct {
+        struct wl_event_queue  *wlBufferEventQueue;
+        pthread_t               bufferReleaseThreadId;
+        int                     bufferReleaseThreadPipe[2];
+    };
+
     struct wl_list link;
 
     EGLBoolean isSurfaceProducer;
@@ -94,8 +129,6 @@ typedef struct WlEglSurfaceRec {
      */
     pthread_mutex_t mutexLock;
 } WlEglSurface;
-
-extern struct wl_list wlEglSurfaceList;
 
 WL_EXPORT
 EGLBoolean wlEglInitializeSurfaceExport(WlEglSurface *surface);
@@ -119,7 +152,7 @@ EGLBoolean wlEglDestroySurfaceHook(EGLDisplay dpy, EGLSurface eglSurface);
 EGLBoolean wlEglDestroyAllSurfaces(WlEglDisplay *display);
 
 EGLBoolean wlEglIsWaylandWindowValid(struct wl_egl_window *window);
-EGLBoolean wlEglIsWlEglSurface(WlEglSurface *wlEglSurface);
+EGLBoolean wlEglIsWlEglSurfaceForDisplay(WlEglDisplay *display, WlEglSurface *wlEglSurface);
 
 EGLBoolean wlEglQueryNativeResourceHook(EGLDisplay dpy,
                                         void *nativeResource,
@@ -132,8 +165,10 @@ EGLBoolean wlEglSendDamageEvent(WlEglSurface *surface,
 void wlEglCreateFrameSync(WlEglSurface *surface);
 EGLint wlEglWaitFrameSync(WlEglSurface *surface);
 
-EGLBoolean wlEglSurfaceRef(WlEglSurface *surface);
+EGLBoolean wlEglSurfaceRef(WlEglDisplay *display, WlEglSurface *surface);
 void wlEglSurfaceUnref(WlEglSurface *surface);
+
+EGLint wlEglHandleImageStreamEvents(WlEglSurface *surface);
 
 #ifdef __cplusplus
 }

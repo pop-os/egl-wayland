@@ -23,6 +23,7 @@
 #include "wayland-eglsurface.h"
 #include "wayland-eglstream-client-protocol.h"
 #include "wayland-eglstream-controller-client-protocol.h"
+#include "linux-dmabuf-unstable-v1-client-protocol.h"
 #include "wayland-eglstream-server.h"
 #include "wayland-thread.h"
 #include "wayland-eglutils.h"
@@ -37,16 +38,33 @@
 #include <sys/types.h>
 #include <netinet/in.h>
 #include <fcntl.h>
+#include <poll.h>
+#include <errno.h>
 
 #define WL_EGL_WINDOW_DESTROY_CALLBACK_SINCE 3
 
-struct wl_list wlEglSurfaceList = WL_LIST_INIT(&wlEglSurfaceList);
+enum BufferReleaseThreadEvents {
+    BUFFER_RELEASE_THREAD_EVENT_TERMINATE,
+};
 
-EGLBoolean wlEglIsWlEglSurface(WlEglSurface *surface)
+enum BufferReleasePipeEndpoints {
+    BUFFER_RELEASE_PIPE_READ  = 0,
+    BUFFER_RELEASE_PIPE_WRITE = 1
+};
+
+static WlEglStreamImage *
+pop_acquired_image(WlEglSurface *surface);
+
+static void
+remove_surface_image(WlEglDisplay *display,
+                     WlEglSurface *surface,
+                     EGLImageKHR eglImage);
+
+EGLBoolean wlEglIsWlEglSurfaceForDisplay(WlEglDisplay *display, WlEglSurface *surface)
 {
     WlEglSurface *surf;
 
-    wl_list_for_each(surf, &wlEglSurfaceList, link) {
+    wl_list_for_each(surf, &display->wlEglSurfaceList, link) {
         if (surf == surface) {
             return EGL_TRUE;
         }
@@ -59,31 +77,19 @@ EGLBoolean wlEglIsWaylandWindowValid(struct wl_egl_window *window)
 {
     struct wl_surface *surface = NULL;
 
-#if HAS_MINCORE
-    if (!window || !wlEglPointerIsDereferencable(window)) {
+    if (!window || !wlEglMemoryIsReadable(window, sizeof (*window))) {
         return EGL_FALSE;
     }
 
     surface = (struct wl_surface *)window->version;
-    if (!wlEglPointerIsDereferencable(surface)) {
+    if (!wlEglMemoryIsReadable(surface, sizeof (void *))) {
         surface = window->surface;
-        if (!wlEglPointerIsDereferencable(surface)) {
+        if (!wlEglMemoryIsReadable(surface, sizeof (void *))) {
             return EGL_FALSE;
         }
     }
-    return WL_CHECK_INTERFACE_TYPE(surface, wl_surface_interface);
-#else
-    /*
-     * Note that dereferencing an invalid surface pointer could mean an old
-     * version of libwayland-egl.so is loaded, which may not support version
-     * member in wl_egl_window struct.
-     */
-    surface = window->surface;
-
-    /* wl_surface is a wl_proxy, which is a wl_object. wl_objects's first
-     * element points to the interface type */
-    return (((*(void **)surface)) == &wl_surface_interface);
-#endif
+    return wlEglCheckInterfaceType((struct wl_object *)surface,
+                                   "wl_surface");
 }
 
 static void
@@ -157,18 +163,40 @@ EGLint wlEglWaitFrameSync(WlEglSurface *surface)
 EGLBoolean
 wlEglSendDamageEvent(WlEglSurface *surface, struct wl_event_queue *queue)
 {
-    /* Attach same buffer to indicate new content for the surface is
-     * made available by the client */
-    wl_surface_attach(surface->wlSurface,
-                      surface->ctx.wlStreamResource,
-                      surface->dx,
-                      surface->dy);
+    struct wl_display *wlDpy = surface->wlEglDpy->nativeDpy;
+
+    if (surface->ctx.wlStreamResource) {
+        /* Attach same buffer to indicate new content for the surface is
+         * made available by the client */
+        wl_surface_attach(surface->wlSurface,
+                          surface->ctx.wlStreamResource,
+                          surface->dx,
+                          surface->dy);
+    } else {
+        WlEglStreamImage *image;
+
+        if (wlEglHandleImageStreamEvents(surface) != EGL_SUCCESS) {
+            return EGL_FALSE;
+        }
+
+        image = pop_acquired_image(surface);
+        if (image) {
+            surface->ctx.currentBuffer = image->buffer;
+            image->attached = EGL_TRUE;
+        }
+
+        wl_surface_attach(surface->wlSurface,
+                          surface->ctx.currentBuffer,
+                          surface->dx,
+                          surface->dy);
+    }
+
     wl_surface_damage(surface->wlSurface, 0, 0,
                       surface->width, surface->height);
     wl_surface_commit(surface->wlSurface);
     surface->ctx.isAttached = EGL_TRUE;
 
-    return (wl_display_roundtrip_queue(surface->wlEglDpy->nativeDpy,
+    return (wl_display_roundtrip_queue(wlDpy,
                                        queue) >= 0) ? EGL_TRUE : EGL_FALSE;
 }
 
@@ -305,6 +333,158 @@ finish_wl_eglstream_damage_thread(WlEglSurface *surface,
     }
 }
 
+static void*
+buffer_release_thread(void *args)
+{
+    WlEglSurface           *surface = (WlEglSurface*)args;
+    WlEglDisplay           *display = surface->wlEglDpy;
+    struct wl_display      *wlDpy = display->nativeDpy;
+    struct wl_event_queue  *queue = surface->wlBufferEventQueue;
+    struct pollfd           pfds[2];
+    const int               fd = wl_display_get_fd(wlDpy);
+    int                     res;
+    uint8_t                 cmd;
+
+    while (1) {
+        /* First clear out any previously-read events on the queue */
+        wl_display_dispatch_queue_pending(wlDpy, queue);
+
+        /*
+         * Now block until more events are present on the wire, then
+         * read them. Also, watch for messages from the app thread.
+         */
+        if ((wl_display_prepare_read_queue(wlDpy, queue) < 0)) {
+            if (errno == EAGAIN) {
+                continue;
+            } else {
+                return NULL;
+            }
+        }
+
+        memset(&pfds, 0, sizeof(pfds));
+        pfds[0].fd = fd;
+        pfds[0].events = POLLIN;
+        pfds[1].fd =
+            surface->bufferReleaseThreadPipe[BUFFER_RELEASE_PIPE_READ];
+        pfds[1].events = POLLIN;
+        res = poll(&pfds[0], sizeof(pfds) / sizeof(pfds[0]), 1000);
+
+        if (res <= 0) {
+            wl_display_cancel_read(wlDpy);
+            continue;
+        }
+
+        if (pfds[1].revents & POLLIN) {
+            if (read(pfds[1].fd, &cmd, sizeof(cmd) != sizeof(cmd))) {
+                /* Reading an event from the app side failed. Bail. */
+                wl_display_cancel_read(wlDpy);
+                return NULL;
+            }
+
+            switch (cmd) {
+            default:
+                /*
+                 * Unknown command from the app side. Treat it like a
+                 * termination request.
+                 *
+                 * fall through.
+                 */
+            case BUFFER_RELEASE_THREAD_EVENT_TERMINATE:
+                wl_display_cancel_read(wlDpy);
+                return NULL;
+            }
+        }
+
+        if (pfds[0].revents & POLLIN) {
+            if (wl_display_read_events(wlDpy) < 0) {
+                return NULL;
+            }
+        } else {
+            wl_display_cancel_read(wlDpy);
+        }
+    }
+
+    return NULL;
+}
+
+static EGLint setup_wl_buffer_release_thread(WlEglSurface *surface)
+{
+    int ret;
+
+    if (pipe(surface->bufferReleaseThreadPipe)) {
+        return EGL_BAD_ALLOC;
+    }
+
+    surface->wlBufferEventQueue =
+        wl_display_create_queue(surface->wlEglDpy->nativeDpy);
+
+    ret = pthread_create(&surface->bufferReleaseThreadId, NULL,
+                         buffer_release_thread, (void*)surface);
+    if (ret != 0) {
+        close(surface->bufferReleaseThreadPipe[BUFFER_RELEASE_PIPE_WRITE]);
+        surface->bufferReleaseThreadPipe[BUFFER_RELEASE_PIPE_WRITE] = -1;
+        close(surface->bufferReleaseThreadPipe[BUFFER_RELEASE_PIPE_READ]);
+        surface->bufferReleaseThreadPipe[BUFFER_RELEASE_PIPE_READ] = -1;
+        wl_event_queue_destroy(surface->wlBufferEventQueue);
+        surface->wlBufferEventQueue = NULL;
+        return EGL_BAD_ALLOC;
+    }
+
+    return EGL_SUCCESS;
+}
+
+static void
+finish_wl_buffer_release_thread(WlEglSurface *surface)
+{
+    uint8_t cmd = BUFFER_RELEASE_THREAD_EVENT_TERMINATE;
+
+    if (surface->wlBufferEventQueue) {
+        if (write(surface->bufferReleaseThreadPipe[BUFFER_RELEASE_PIPE_WRITE],
+                  &cmd, sizeof(cmd)) != sizeof(cmd)) {
+            /* The thread is not going to terminate gracefully. */
+            pthread_cancel(surface->bufferReleaseThreadId);
+        }
+        pthread_join(surface->bufferReleaseThreadId, NULL);
+        surface->bufferReleaseThreadId = (pthread_t)0;
+
+        close(surface->bufferReleaseThreadPipe[BUFFER_RELEASE_PIPE_WRITE]);
+        surface->bufferReleaseThreadPipe[BUFFER_RELEASE_PIPE_WRITE] = -1;
+        close(surface->bufferReleaseThreadPipe[BUFFER_RELEASE_PIPE_READ]);
+        surface->bufferReleaseThreadPipe[BUFFER_RELEASE_PIPE_READ] = -1;
+
+        wl_event_queue_destroy(surface->wlBufferEventQueue);
+    }
+}
+
+static void
+destroy_stream_image(WlEglDisplay *display,
+                     WlEglSurface *surface,
+                     WlEglStreamImage *image)
+{
+    WlEglPlatformData   *data     = display->data;
+    EGLDisplay           dpy      = display->devDpy->eglDisplay;
+
+    /* Must be called with image->mutex already locked */
+
+    assert(image->eglImage != EGL_NO_IMAGE_KHR);
+    data->egl.destroyImage(dpy, image->eglImage);
+    image->eglImage = EGL_NO_IMAGE_KHR;
+
+    if (surface->ctx.currentBuffer == image->buffer) {
+        surface->ctx.currentBuffer = NULL;
+    }
+
+    if (image->buffer && !image->attached) {
+        wl_buffer_destroy(image->buffer);
+        image->buffer = NULL;
+    }
+
+    if (!wl_list_empty(&image->acquiredLink)) {
+        wl_list_remove(&image->acquiredLink);
+        wl_list_init(&image->acquiredLink);
+    }
+}
+
 static void
 destroy_surface_context(WlEglSurface *surface, WlEglSurfaceCtx *ctx)
 {
@@ -314,12 +494,23 @@ destroy_surface_context(WlEglSurface *surface, WlEglSurfaceCtx *ctx)
     EGLSurface         surf     = ctx->eglSurface;
     EGLStreamKHR       stream   = ctx->eglStream;
     void              *resource = ctx->wlStreamResource;
+    uint32_t           i;
 
     finish_wl_eglstream_damage_thread(surface, ctx, 1);
 
     ctx->eglSurface       = EGL_NO_SURFACE;
     ctx->eglStream        = EGL_NO_STREAM_KHR;
     ctx->wlStreamResource = NULL;
+
+    for (i = 0; i < ctx->numStreamImages; i++) {
+        WlEglStreamImage *image = surface->ctx.streamImages[i];
+
+        pthread_mutex_lock(&image->mutex);
+        if (image->eglImage != EGL_NO_IMAGE_KHR) {
+            destroy_stream_image(display, surface, image);
+        }
+        pthread_mutex_unlock(&image->mutex);
+    }
 
     if (surf != EGL_NO_SURFACE) {
         data->egl.destroySurface(dpy, surf);
@@ -347,7 +538,7 @@ discard_surface_context(WlEglSurface *surface)
      * displayed. In that case, defer its destruction until we make sure the
      * compositor doesn't need it anymore (i.e. upon stream release);
      * otherwise, we can just destroy it right away */
-    if (surface->ctx.isAttached) {
+    if (surface->ctx.isAttached && surface->ctx.wlStreamResource) {
         WlEglSurfaceCtx *ctx = malloc(sizeof(WlEglSurfaceCtx));
         if (ctx) {
             memcpy(ctx, &surface->ctx, sizeof(*ctx));
@@ -391,6 +582,10 @@ create_wl_eglstream(WlEglSurface *surface,
     struct wl_buffer            *buffer  = NULL;
     int32_t                      width;
     int32_t                      height;
+
+    if (!display->wlStreamDpy) {
+        return NULL;
+    }
 
     if (surface->isSurfaceProducer) {
         assert(window);
@@ -723,6 +918,400 @@ fail:
 }
 #endif
 
+static void
+stream_local_buffer_release_callback(void *ptr, struct wl_buffer *buffer)
+{
+    WlEglStreamImage   *image = (WlEglStreamImage*)ptr;
+    /* Safe: image->surface pointer value is const once image is initialized */
+    WlEglSurface       *surface = image->surface;
+    WlEglDisplay       *display = surface->wlEglDpy;
+    WlEglPlatformData  *data    = display->data;
+
+    (void)buffer; /* In case assert() compiles to nothing */
+    assert(image->buffer == NULL || image->buffer == buffer);
+
+    pthread_mutex_lock(&image->mutex);
+    image->attached = EGL_FALSE;
+
+    if (image->eglImage != EGL_NO_IMAGE_KHR) {
+        data->egl.streamReleaseImage(display->devDpy->eglDisplay,
+                                     surface->ctx.eglStream,
+                                     image->eglImage,
+                                     EGL_NO_SYNC_KHR);
+    } else if (image->buffer) {
+        /*
+         * If the image has been destroyed while the buffer was attached
+         * the buffer destruction was deferred. Clean it up now.
+         */
+        wl_buffer_destroy(image->buffer);
+        image->buffer = NULL;
+    }
+
+    pthread_mutex_unlock(&image->mutex);
+}
+
+static const struct wl_buffer_listener stream_local_buffer_listener = {
+    stream_local_buffer_release_callback,
+};
+
+static EGLint
+acquire_surface_image(WlEglDisplay *display, WlEglSurface *surface)
+{
+    WlEglPlatformData  *data        = display->data;
+    EGLDisplay          dpy         = display->devDpy->eglDisplay;
+    EGLImageKHR         eglImage;
+    WlEglStreamImage   *image = NULL;
+    struct zwp_linux_dmabuf_v1 *wrapper = NULL;
+    struct zwp_linux_buffer_params_v1 *params;
+    EGLuint64KHR        modifier;
+    int                 format;
+    int                 planes;
+    EGLint              stride;
+    EGLint              offset;
+    uint32_t            i;
+    int                 fd;
+
+    if (!data->egl.streamAcquireImage(dpy,
+                                      surface->ctx.eglStream,
+                                      &eglImage,
+                                      EGL_NO_SYNC_KHR)) {
+        return EGL_BAD_SURFACE;
+    }
+
+    for (i = 0; i < surface->ctx.numStreamImages; i++) {
+        if (surface->ctx.streamImages[i]->eglImage == eglImage) {
+            image = surface->ctx.streamImages[i];
+            break;
+        }
+    }
+
+    if (!image) {
+        goto fail_release;
+    }
+
+    pthread_mutex_lock(&image->mutex);
+
+    if (!image->buffer) {
+        if (!data->egl.exportDMABUFImageQuery(dpy,
+                                              eglImage,
+                                              &format,
+                                              &planes,
+                                              &modifier)) {
+            goto fail_release;
+        }
+
+        assert(planes == 1); /* XXX support planar formats */
+
+        if (!data->egl.exportDMABUFImage(dpy,
+                                         eglImage,
+                                         &fd,
+                                         &stride,
+                                         &offset)) {
+            goto fail_release;
+        }
+
+        wrapper = wl_proxy_create_wrapper(display->wlDmaBuf);
+        wl_proxy_set_queue((struct wl_proxy *)wrapper, surface->wlBufferEventQueue);
+
+        params = zwp_linux_dmabuf_v1_create_params(wrapper);
+
+        zwp_linux_buffer_params_v1_add(params,
+                                       fd,
+                                       0, /* XXX support planar formats */
+                                       offset,
+                                       stride,
+                                       modifier >> 32,
+                                       modifier & 0xffffffff);
+
+        image->buffer = zwp_linux_buffer_params_v1_create_immed(params,
+                                                                surface->width,
+                                                                surface->height,
+                                                                format, 0);
+
+        zwp_linux_buffer_params_v1_destroy(params);
+        wl_proxy_wrapper_destroy(wrapper); /* Done with wrapper */
+        close(fd);
+
+        if (!image->buffer) {
+            goto fail_release;
+        }
+
+        if (wl_buffer_add_listener(image->buffer,
+                                   &stream_local_buffer_listener,
+                                   image) == -1) {
+            wl_buffer_destroy(image->buffer);
+            image->buffer = NULL;
+            goto fail_release;
+        }
+    }
+
+    /* Add image to the end of the acquired images list */
+    wl_list_insert(surface->ctx.acquiredImages.prev, &image->acquiredLink);
+
+    pthread_mutex_unlock(&image->mutex);
+
+    return EGL_SUCCESS;
+
+fail_release:
+    /* Release the image back to the stream */
+    data->egl.streamReleaseImage(dpy,
+                                 surface->ctx.eglStream,
+                                 eglImage,
+                                 EGL_NO_SYNC_KHR);
+
+    if (image) {
+        /* Release the image lock */
+        pthread_mutex_unlock(&image->mutex);
+    }
+
+    return EGL_BAD_SURFACE;
+}
+
+static void
+remove_surface_image(WlEglDisplay *display,
+                     WlEglSurface *surface,
+                     EGLImageKHR eglImage)
+{
+    WlEglStreamImage    *image;
+    uint32_t             i;
+    EGLBoolean           found = EGL_FALSE;
+
+    for (i = 0; i < surface->ctx.numStreamImages && found == EGL_FALSE; i++) {
+        image = surface->ctx.streamImages[i];
+        pthread_mutex_lock(&image->mutex);
+        if (image->eglImage == eglImage) {
+            found = EGL_TRUE;
+            destroy_stream_image(display, surface, image);
+        }
+        pthread_mutex_unlock(&image->mutex);
+    }
+}
+
+static WlEglStreamImage *
+pop_acquired_image(WlEglSurface *surface)
+{
+    WlEglStreamImage *image;
+
+    wl_list_for_each(image, &surface->ctx.acquiredImages, acquiredLink) {
+        /* Safe only because the iteration is aborted by returning */
+        wl_list_remove(&image->acquiredLink);
+        wl_list_init(&image->acquiredLink);
+        return image;
+    }
+
+    /* List is empty. Return NULL. */
+    return NULL;
+}
+
+static EGLint
+add_surface_image(WlEglDisplay *display, WlEglSurface *surface)
+{
+    WlEglPlatformData   *data     = display->data;
+    EGLDisplay           dpy      = display->devDpy->eglDisplay;
+    WlEglStreamImage   **newImages;
+    WlEglStreamImage    *image;
+    EGLImageKHR          eglImage;
+    uint32_t             i;
+
+    for (i = 0; i < surface->ctx.numStreamImages; i++) {
+        image = surface->ctx.streamImages[i];
+        pthread_mutex_lock(&image->mutex);
+        if ((image->eglImage == EGL_NO_IMAGE_KHR) && !image->buffer) {
+            eglImage = image->eglImage =
+                data->egl.createImage(dpy,
+                                      EGL_NO_CONTEXT,
+                                      EGL_STREAM_CONSUMER_IMAGE_NV,
+                                      (EGLClientBuffer)surface->ctx.eglStream,
+                                      NULL);
+
+            pthread_mutex_unlock(&image->mutex);
+
+            if (eglImage != EGL_NO_IMAGE_KHR) {
+                return EGL_SUCCESS;
+            } else {
+                return EGL_BAD_ALLOC;
+            }
+        }
+        pthread_mutex_unlock(&image->mutex);
+    }
+
+    newImages = realloc(surface->ctx.streamImages,
+                        sizeof(newImages[0]) *
+                        (surface->ctx.numStreamImages + 1));
+
+    if (!newImages) {
+        return EGL_BAD_ALLOC;
+    }
+
+    surface->ctx.streamImages = newImages;
+
+    newImages[i] = calloc(1, sizeof(*newImages[i]));
+
+    if (!surface->ctx.streamImages[i]) {
+        goto free_image;
+    }
+
+    newImages[i]->surface = surface;
+
+    /*
+     * No need to lock the mutex after allocating because numStreamImages is not
+     * incremented until after the image itself is initialized. Also, because
+     * numStreamImages is not incremented until initialization is complete, the
+     * image must be freed if initialization fails beyond this point to avoid
+     * leaks.
+     */
+    if (!wlEglInitializeMutex(&newImages[i]->mutex)) {
+        goto free_image;
+    }
+
+    wl_list_init(&newImages[i]->acquiredLink);
+    newImages[i]->eglImage =
+        data->egl.createImage(dpy,
+                              EGL_NO_CONTEXT,
+                              EGL_STREAM_CONSUMER_IMAGE_NV,
+                              (EGLClientBuffer)surface->ctx.eglStream,
+                              NULL);
+
+    if (newImages[i]->eglImage == EGL_NO_IMAGE_KHR) {
+        wlEglMutexDestroy(&newImages[i]->mutex);
+        goto free_image;
+    }
+
+    surface->ctx.numStreamImages++;
+
+    return EGL_SUCCESS;
+
+free_image:
+    free(newImages[i]);
+    newImages[i] = NULL;
+
+    return EGL_BAD_ALLOC;
+}
+
+EGLint wlEglHandleImageStreamEvents(WlEglSurface *surface)
+{
+    WlEglDisplay         *display = surface->wlEglDpy;
+    EGLDisplay            dpy     = display->devDpy->eglDisplay;
+    WlEglPlatformData    *data    = display->data;
+    EGLAttrib             aux;
+    EGLenum               event;
+    EGLint                err = EGL_SUCCESS;
+
+    if (surface->ctx.wlStreamResource) {
+        /* Not a local stream */
+        return err;
+    }
+
+    while (1) {
+        err = data->egl.queryStreamConsumerEvent(dpy,
+                                                 surface->ctx.eglStream,
+                                                 0,
+                                                 &event,
+                                                 &aux);
+
+        if (err == EGL_TRUE) {
+            err = EGL_SUCCESS;
+        } else if (err == EGL_TIMEOUT_EXPIRED) {
+            err = EGL_SUCCESS;
+            break;
+        } else if (err == EGL_FALSE) {
+            /* XXX Pick the right error code */
+            err = EGL_BAD_SURFACE;
+            break;
+        } else {
+            break;
+        }
+
+        switch (event) {
+        case EGL_STREAM_IMAGE_AVAILABLE_NV:
+            err = acquire_surface_image(display, surface);
+            break;
+        case EGL_STREAM_IMAGE_ADD_NV:
+            err = add_surface_image(display, surface);
+            break;
+
+        case EGL_STREAM_IMAGE_REMOVE_NV:
+            remove_surface_image(display, surface, (EGLImageKHR)aux);
+            break;
+
+        default:
+            assert(!"Unhandled EGLImage stream consumer event");
+        }
+    }
+
+    return err;
+}
+
+static EGLint create_surface_stream_local(WlEglSurface *surface)
+{
+    WlEglDisplay         *display = surface->wlEglDpy;
+    WlEglPlatformData    *data    = display->data;
+    EGLDisplay            dpy     = display->devDpy->eglDisplay;
+    EGLint                eglAttribs[] = {
+        EGL_STREAM_FIFO_LENGTH_KHR, surface->fifoLength,
+        EGL_NONE,                   EGL_NONE,
+        EGL_NONE
+    };
+    EGLint err = EGL_SUCCESS;
+
+    /* We don't have any mechanism to check whether the compositor is going to
+     * use this surface for composition or not when using local streams, so
+     * just enable FIFO_SYNCHRONOUS if the extensions are supported.
+     * Note the use of this mechanism makes the optional sync parameter
+     * passed to eglStreamAcquireImageNV() redundant, so that mechanism is not
+     * used in this library.
+     */
+    if (display->devDpy->exts.stream_fifo_synchronous &&
+        display->devDpy->exts.stream_sync &&
+        surface->fifoLength > 0) {
+        eglAttribs[2] = EGL_STREAM_FIFO_SYNCHRONOUS_NV;
+        eglAttribs[3] = EGL_TRUE;
+    }
+
+    /* First, create the EGLStream */
+    surface->ctx.eglStream =
+        data->egl.createStream(dpy, eglAttribs);
+    if (surface->ctx.eglStream == EGL_NO_STREAM_KHR) {
+        err = data->egl.getError();
+        goto fail;
+    }
+
+    /* Now create the local EGLImage consumer */
+    if (!data->egl.streamImageConsumerConnect(dpy,
+                                              surface->ctx.eglStream,
+                                              0, /* XXX modifier count */
+                                              NULL, /* XXX modifier list */
+                                              NULL)) {
+        err = data->egl.getError();
+        goto fail;
+    }
+
+    wl_list_init(&surface->ctx.acquiredImages);
+
+    if (!surface->wlBufferEventQueue) {
+        /*
+         * Local stream contexts need a private wayland queue used by a separate
+         * thread that can process buffer release events even the application
+         * thread is blocking in the EGL library for stream frame acquisition
+         * while swapping the producer surface. The thread and queue are owned
+         * by the surface because they need to outlive the context when resizing
+         * the surface while a buffer is still attached, but they are
+         * initialized lazily here to avoid incuring the cost of an extra unused
+         * thread and two pipe file descriptors per surface when they are not
+         * needed.
+         */
+        if (EGL_SUCCESS != setup_wl_buffer_release_thread(surface)) {
+            goto fail;
+        }
+    }
+
+    return EGL_SUCCESS;
+
+fail:
+    destroy_surface_context(surface, &surface->ctx);
+    return err;
+}
+
 static EGLint
 create_surface_stream(WlEglSurface *surface)
 {
@@ -734,10 +1323,20 @@ create_surface_stream(WlEglSurface *surface)
      * there is more than one method giving the same efficiency, the more
      * versatile/configurable one would be preferred:
      *
-     *    1. Cross-process unix sockets
-     *    2. Cross-process FD
-     *    3. Cross-process inet sockets
+     *    1. Local stream + dma-buf
+     *    2. Cross-process unix sockets
+     *    3. Cross-process FD
+     *    4. Cross-process inet sockets
      */
+#ifdef EGL_NV_stream_consumer_eglimage
+    if ((err != EGL_SUCCESS) &&
+        display->devDpy->exts.stream_consumer_eglimage &&
+        display->devDpy->exts.image_dma_buf_export &&
+        display->wlDmaBuf) {
+        err = create_surface_stream_local(surface);
+    }
+#endif
+
 #ifdef EGL_NV_stream_remote
     if ((err != EGL_SUCCESS) &&
         display->caps.stream_socket &&
@@ -801,68 +1400,70 @@ create_surface_context(WlEglSurface *surface)
         goto fail;
     }
 
-    /* Then attach the wl_eglstream so the compositor connects a consumer to the
-     * EGLStream */
-    if (display->wlStreamCtl != NULL) {
-        if (display->wlStreamCtlVer >=
-            WL_EGLSTREAM_CONTROLLER_ATTACH_EGLSTREAM_CONSUMER_ATTRIB_SINCE) {
-            wl_array_init(&wlAttribs);
+    /* If the stream has a server component, attach the wl_eglstream so the
+     * compositor connects a consumer to the EGLStream */
+    if (surface->ctx.wlStreamResource) {
+        if (display->wlStreamCtl != NULL) {
+            if (display->wlStreamCtlVer >=
+                WL_EGLSTREAM_CONTROLLER_ATTACH_EGLSTREAM_CONSUMER_ATTRIB_SINCE) {
+                wl_array_init(&wlAttribs);
 
-            if (!wl_array_add(&wlAttribs, 2 * sizeof(intptr_t))) {
-                wl_array_release(&wlAttribs);
-                err = EGL_BAD_ALLOC;
-                goto fail;
-            }
-
-            wlAttribsData = (intptr_t *)wlAttribs.data;
-            wlAttribsData[0] = WL_EGLSTREAM_CONTROLLER_ATTRIB_PRESENT_MODE;
-
-            if (surface->isSurfaceProducer) {
-                wlAttribsData[1] = WL_EGLSTREAM_CONTROLLER_PRESENT_MODE_DONT_CARE;
-            } else if (surface->fifoLength > 0) {
                 if (!wl_array_add(&wlAttribs, 2 * sizeof(intptr_t))) {
                     wl_array_release(&wlAttribs);
                     err = EGL_BAD_ALLOC;
                     goto fail;
                 }
-                wlAttribsData    = (intptr_t *)wlAttribs.data;
-                wlAttribsData[1] = WL_EGLSTREAM_CONTROLLER_PRESENT_MODE_FIFO;
-                wlAttribsData[2] = WL_EGLSTREAM_CONTROLLER_ATTRIB_FIFO_LENGTH;
-                wlAttribsData[3] = surface->fifoLength;
+
+                wlAttribsData = (intptr_t *)wlAttribs.data;
+                wlAttribsData[0] = WL_EGLSTREAM_CONTROLLER_ATTRIB_PRESENT_MODE;
+
+                if (surface->isSurfaceProducer) {
+                    wlAttribsData[1] = WL_EGLSTREAM_CONTROLLER_PRESENT_MODE_DONT_CARE;
+                } else if (surface->fifoLength > 0) {
+                    if (!wl_array_add(&wlAttribs, 2 * sizeof(intptr_t))) {
+                        wl_array_release(&wlAttribs);
+                        err = EGL_BAD_ALLOC;
+                        goto fail;
+                    }
+                    wlAttribsData    = (intptr_t *)wlAttribs.data;
+                    wlAttribsData[1] = WL_EGLSTREAM_CONTROLLER_PRESENT_MODE_FIFO;
+                    wlAttribsData[2] = WL_EGLSTREAM_CONTROLLER_ATTRIB_FIFO_LENGTH;
+                    wlAttribsData[3] = surface->fifoLength;
+                } else {
+                    wlAttribsData[1] = WL_EGLSTREAM_CONTROLLER_PRESENT_MODE_MAILBOX;
+                }
+
+                wl_eglstream_controller_attach_eglstream_consumer_attribs(display->wlStreamCtl,
+                                                                          surface->wlSurface,
+                                                                          surface->ctx.wlStreamResource,
+                                                                          &wlAttribs);
+                wl_array_release(&wlAttribs);
             } else {
-                wlAttribsData[1] = WL_EGLSTREAM_CONTROLLER_PRESENT_MODE_MAILBOX;
+                wl_eglstream_controller_attach_eglstream_consumer(display->wlStreamCtl,
+                                                                  surface->wlSurface,
+                                                                  surface->ctx.wlStreamResource);
             }
-
-            wl_eglstream_controller_attach_eglstream_consumer_attribs(display->wlStreamCtl,
-                                                                      surface->wlSurface,
-                                                                      surface->ctx.wlStreamResource,
-                                                                      &wlAttribs);
-            wl_array_release(&wlAttribs);
         } else {
-            wl_eglstream_controller_attach_eglstream_consumer(display->wlStreamCtl,
-                                                              surface->wlSurface,
-                                                              surface->ctx.wlStreamResource);
+            wl_surface_attach(surface->wlSurface,
+                              surface->ctx.wlStreamResource,
+                              winDx,
+                              winDy);
+            wl_surface_commit(surface->wlSurface);
+
+            /* Since we are using the legacy method of overloading wl_surface_attach
+             * in order to create the server-side EGLStream here, the compositor
+             * will actually take this as a new buffer. We mark it as 'attached'
+             * because whenever a new wl_surface_attach request is issued, the
+             * compositor will emit back a wl_buffer_release event, and we will
+             * destroy the context then. */
+            surface->ctx.isAttached = EGL_TRUE;
         }
-    } else {
-        wl_surface_attach(surface->wlSurface,
-                          surface->ctx.wlStreamResource,
-                          winDx,
-                          winDy);
-        wl_surface_commit(surface->wlSurface);
 
-        /* Since we are using the legacy method of overloading wl_surface_attach
-         * in order to create the server-side EGLStream here, the compositor
-         * will actually take this as a new buffer. We mark it as 'attached'
-         * because whenever a new wl_surface_attach request is issued, the
-         * compositor will emit back a wl_buffer_release event, and we will
-         * destroy the context then. */
-        surface->ctx.isAttached = EGL_TRUE;
-    }
-
-    if (wl_display_roundtrip_queue(display->nativeDpy,
-                                   surface->wlEventQueue) < 0) {
-        err = EGL_BAD_ALLOC;
-        goto fail;
+        if (wl_display_roundtrip_queue(display->nativeDpy,
+                                       surface->wlEventQueue) < 0) {
+            err = EGL_BAD_ALLOC;
+            goto fail;
+        }
     }
 
     if (surface->isSurfaceProducer) {
@@ -914,33 +1515,43 @@ fail:
 
 EGLBoolean wlEglInitializeSurfaceExport(WlEglSurface *surface)
 {
-    WlEglDisplay *display = surface->wlEglDpy;
+    WlEglDisplay *display = wlEglAcquireDisplay((WlEglDisplay *)surface->wlEglDpy);
 
-    wlExternalApiLock();
+    if (!display) {
+        return EGL_FALSE;
+    }
+
+    pthread_mutex_lock(&display->mutex);
+
     // Create per surface wayland queue
     surface->wlEventQueue = wl_display_create_queue(display->nativeDpy);
     surface->refCount = 1;
 
     if (!wlEglInitializeMutex(&surface->mutexLock)) {
-        wlExternalApiUnlock();
+        pthread_mutex_unlock(&display->mutex);
+        wlEglReleaseDisplay(display);
         return EGL_FALSE;
     }
 
     if (create_surface_context(surface) != EGL_SUCCESS) {
         wl_event_queue_destroy(surface->wlEventQueue);
-        wlExternalApiUnlock();
+        pthread_mutex_unlock(&display->mutex);
+        wlEglReleaseDisplay(display);
         return EGL_FALSE;
     }
 
-    wl_list_insert(&wlEglSurfaceList, &surface->link);
+    wl_list_insert(&display->wlEglSurfaceList, &surface->link);
     wl_list_init(&surface->oldCtxList);
 
-    /* Set client's pendingSwapIntervalUpdate for updating client's
-     * swapinterval
-     */
-    surface->pendingSwapIntervalUpdate = EGL_TRUE;
+    if (surface->ctx.wlStreamResource) {
+        /* Set client's pendingSwapIntervalUpdate for updating client's
+         * swapinterval
+         */
+        surface->pendingSwapIntervalUpdate = EGL_TRUE;
+    }
 
-    wlExternalApiUnlock();
+    pthread_mutex_unlock(&display->mutex);
+    wlEglReleaseDisplay(display);
     return EGL_TRUE;
 }
 
@@ -989,10 +1600,12 @@ resize_callback(struct wl_egl_window *window, void *data)
                                    surface,
                                    pData->egl.getCurrentContext());
 
-            /* Set client's pendingSwapIntervalUpdate for updating client's
-             * swapinterval
-             */
-            surface->pendingSwapIntervalUpdate = EGL_TRUE;
+            if (surface->ctx.wlStreamResource) {
+                /* Set client's pendingSwapIntervalUpdate for updating client's
+                 * swapinterval
+                 */
+                surface->pendingSwapIntervalUpdate = EGL_TRUE;
+            }
         }
     }
     pthread_mutex_unlock(&surface->mutexLock);
@@ -1074,10 +1687,11 @@ static EGLint assignWlEglSurfaceAttribs(WlEglSurface *surface,
     return EGL_SUCCESS;
 }
 
-EGLBoolean wlEglSurfaceRef(WlEglSurface *surface)
+EGLBoolean wlEglSurfaceRef(WlEglDisplay *display, WlEglSurface *surface)
 {
 
-    if (!wlEglIsWlEglSurface(surface) || surface->wlEglDpy->initCount == 0) {
+    if (!wlEglIsWlEglSurfaceForDisplay(display, surface) ||
+        surface->wlEglDpy->initCount == 0) {
         return EGL_FALSE;
     }
 
@@ -1088,12 +1702,20 @@ EGLBoolean wlEglSurfaceRef(WlEglSurface *surface)
 
 void wlEglSurfaceUnref(WlEglSurface *surface)
 {
+    uint32_t i;
+
     surface->refCount--;
     if (surface->refCount > 0) {
         return;
     }
 
     wlEglMutexDestroy(&surface->mutexLock);
+
+    for (i = 0; i < surface->ctx.numStreamImages; i++) {
+        wlEglMutexDestroy(&surface->ctx.streamImages[i]->mutex);
+        free(surface->ctx.streamImages[i]);
+    }
+    free(surface->ctx.streamImages);
     free(surface);
 
     return;
@@ -1105,8 +1727,11 @@ static EGLBoolean wlEglDestroySurface(EGLDisplay dpy, EGLSurface eglSurface)
     WlEglSurface *surface = (WlEglSurface*)eglSurface;
     WlEglSurfaceCtx       *ctx     = NULL;
     WlEglSurfaceCtx       *next    = NULL;
+    WlEglStreamImage      *image;
+    uint32_t i;
 
-    if (!wlEglIsWlEglSurface(surface) || display != surface->wlEglDpy) {
+    if (!wlEglIsWlEglSurfaceForDisplay(display, surface) ||
+        display != surface->wlEglDpy) {
         return EGL_FALSE;
     }
 
@@ -1122,23 +1747,12 @@ static EGLBoolean wlEglDestroySurface(EGLDisplay dpy, EGLSurface eglSurface)
         // We only expect a valid wlEglWin to be set when using
         // a surface created with EGL_KHR_platform_wayland.
         if (wlEglIsWaylandDisplay(display->nativeDpy) &&
-           (wlEglIsWaylandWindowValid(surface->wlEglWin) ||
-           (!surface->isSurfaceProducer))) {
+            wlEglIsWaylandWindowValid(surface->wlEglWin)) {
 
-            if (surface->wlEventQueue != NULL) {
-                wl_surface_attach(surface->wlSurface, NULL, 0, 0);
-                wl_surface_commit(surface->wlSurface);
-
-                wl_display_roundtrip_queue(display->nativeDpy,
-                                           surface->wlEventQueue);
-            }
-
-            if (surface->isSurfaceProducer) {
-                surface->wlEglWin->driver_private = NULL;
-                surface->wlEglWin->resize_callback = NULL;
-                if (surface->wlEglWinVer >= WL_EGL_WINDOW_DESTROY_CALLBACK_SINCE) {
-                    surface->wlEglWin->destroy_window_callback = NULL;
-                }
+            surface->wlEglWin->driver_private = NULL;
+            surface->wlEglWin->resize_callback = NULL;
+            if (surface->wlEglWinVer >= WL_EGL_WINDOW_DESTROY_CALLBACK_SINCE) {
+                surface->wlEglWin->destroy_window_callback = NULL;
             }
         }
     }
@@ -1162,6 +1776,27 @@ static EGLBoolean wlEglDestroySurface(EGLDisplay dpy, EGLSurface eglSurface)
         free(surface->attribs);
     }
 
+    for (i = 0; i < surface->ctx.numStreamImages; i++) {
+        image = surface->ctx.streamImages[i];
+        pthread_mutex_lock(&image->mutex);
+
+        /*
+         * Destroy any attached buffers to ensure no further buffer release
+         * events are delivered after the buffer release queue and thread are
+         * torn down.
+         */
+        if (image->buffer) {
+            assert(image->attached);
+            wl_buffer_destroy(image->buffer);
+            image->buffer = NULL;
+            image->attached = EGL_FALSE;
+        }
+
+        pthread_mutex_unlock(&image->mutex);
+    }
+
+    finish_wl_buffer_release_thread(surface);
+
     // Release WlEglSurface lock.
     pthread_mutex_unlock(&surface->mutexLock);
 
@@ -1174,17 +1809,18 @@ static void
 destroy_callback(void *data)
 {
     WlEglSurface *surface = (WlEglSurface*)data;
+    WlEglDisplay *display = surface->wlEglDpy;
 
-    wlExternalApiLock();
+    pthread_mutex_lock(&display->mutex);
 
     if (!surface || surface->wlEglDpy->initCount == 0) {
-        wlExternalApiUnlock();
+        pthread_mutex_unlock(&display->mutex);
         return;
     }
 
     wlEglDestroySurface((EGLDisplay)surface->wlEglDpy,
                         (EGLSurface)surface);
-    wlExternalApiUnlock();
+    pthread_mutex_unlock(&display->mutex);
 }
 
 static void
@@ -1197,20 +1833,16 @@ getWlEglWindowVersionAndSurface(struct wl_egl_window *window,
      * 'window->version' replaced 'window->surface', we must check whether
      * 'window->version' is actually a valid pointer. If it is, we are dealing
      * with a wl_egl_window from an old implementation of libwayland-egl.so
-     * Note that this will be disabled if platfrom does not have
-     * mincore(2) to check whether a pointer is valid or not.
      */
 
-     *version = window->version;
-     *surface = window->surface;
+    *version = window->version;
+    *surface = window->surface;
 
-#if HAS_MINCORE
-    if (wlEglPointerIsDereferencable((void *)(window->version))) {
+    if (wlEglMemoryIsReadable((void *)window->version,
+                              sizeof (void *))) {
         *version = 0;
         *surface = (struct wl_surface *)(window->version);
     }
-#endif
-
 }
 
 EGLSurface wlEglCreatePlatformWindowSurfaceHook(EGLDisplay dpy,
@@ -1218,15 +1850,20 @@ EGLSurface wlEglCreatePlatformWindowSurfaceHook(EGLDisplay dpy,
                                                 void *nativeWin,
                                                 const EGLAttrib *attribs)
 {
-    WlEglDisplay         *display = (WlEglDisplay*)dpy;
-    WlEglPlatformData    *data    = display->data;
+    WlEglDisplay         *display = wlEglAcquireDisplay(dpy);
+    WlEglPlatformData    *data    = NULL;
     WlEglSurface         *surface = NULL;
     struct wl_egl_window *window  = (struct wl_egl_window *)nativeWin;
     EGLBoolean            res     = EGL_FALSE;
     EGLint                err     = EGL_SUCCESS;
     EGLint                surfType;
 
-    wlExternalApiLock();
+    if (!display) {
+        return EGL_NO_SURFACE;
+    }
+    pthread_mutex_lock(&display->mutex);
+
+    data = display->data;
 
     if (display->initCount == 0) {
         err = EGL_NOT_INITIALIZED;
@@ -1305,18 +1942,21 @@ EGLSurface wlEglCreatePlatformWindowSurfaceHook(EGLDisplay dpy,
 
     surface->swapInterval = 1; // Default swap interval is 1
 
-    /* Set client's pendingSwapIntervalUpdate for updating client's
-     * swapinterval
-     */
-    surface->pendingSwapIntervalUpdate = EGL_TRUE;
+    if (surface->ctx.wlStreamResource) {
+        /* Set client's pendingSwapIntervalUpdate for updating client's
+         * swapinterval
+         */
+        surface->pendingSwapIntervalUpdate = EGL_TRUE;
+    }
     window->driver_private = surface;
     window->resize_callback = resize_callback;
     if (surface->wlEglWinVer >= WL_EGL_WINDOW_DESTROY_CALLBACK_SINCE) {
         window->destroy_window_callback = destroy_callback;
     }
 
-    wl_list_insert(&wlEglSurfaceList, &surface->link);
-    wlExternalApiUnlock();
+    wl_list_insert(&display->wlEglSurfaceList, &surface->link);
+    pthread_mutex_unlock(&display->mutex);
+    wlEglReleaseDisplay(display);
 
     return surface;
 
@@ -1325,7 +1965,8 @@ fail:
         wlEglDestroySurface(display, surface);
     }
 
-    wlExternalApiUnlock();
+    pthread_mutex_unlock(&display->mutex);
+    wlEglReleaseDisplay(display);
 
     wlEglSetError(data, err);
 
@@ -1351,11 +1992,18 @@ EGLSurface wlEglCreatePbufferSurfaceHook(EGLDisplay dpy,
                                          EGLConfig config,
                                          const EGLint *attribs)
 {
-    WlEglDisplay      *display = (WlEglDisplay*)dpy;
-    WlEglPlatformData *data    = display->data;
+    WlEglDisplay      *display = wlEglAcquireDisplay(dpy);
+    WlEglPlatformData *data    = NULL;
     WlEglSurface      *surface = NULL;
     EGLSurface         surf    = EGL_NO_SURFACE;
     EGLint             err     = EGL_SUCCESS;
+
+    if (!display) {
+        return EGL_NO_SURFACE;
+    }
+    pthread_mutex_lock(&display->mutex);
+
+    data = display->data;
 
     /* Nothing really special needs to be done. Just fall back to the driver's
      * Pbuffer surface creation function */
@@ -1385,13 +2033,16 @@ EGLSurface wlEglCreatePbufferSurfaceHook(EGLDisplay dpy,
     surface->isDestroyed = EGL_FALSE;
     wl_list_init(&surface->oldCtxList);
 
-    wlExternalApiLock();
-    wl_list_insert(&wlEglSurfaceList, &surface->link);
-    wlExternalApiUnlock();
+    wl_list_insert(&display->wlEglSurfaceList, &surface->link);
+    pthread_mutex_unlock(&display->mutex);
+    wlEglReleaseDisplay(display);
 
     return surface;
 
 fail:
+    pthread_mutex_unlock(&display->mutex);
+    wlEglReleaseDisplay(display);
+
     if (err != EGL_SUCCESS) {
         wlEglSetError(data, err);
     }
@@ -1403,11 +2054,18 @@ EGLSurface wlEglCreateStreamProducerSurfaceHook(EGLDisplay dpy,
                                                 EGLStreamKHR stream,
                                                 const EGLint *attribs)
 {
-    WlEglDisplay      *display = (WlEglDisplay*)dpy;
-    WlEglPlatformData *data    = display->data;
+    WlEglDisplay      *display = wlEglAcquireDisplay(dpy);
+    WlEglPlatformData *data    = NULL;
     WlEglSurface      *surface = NULL;
     EGLSurface         surf    = EGL_NO_SURFACE;
     EGLint             err     = EGL_SUCCESS;
+
+    if (!display) {
+        return EGL_NO_SURFACE;
+    }
+    pthread_mutex_lock(&display->mutex);
+
+    data = display->data;
 
     /* Nothing really special needs to be done. Just fall back to the driver's
      * stream producer surface creation function */
@@ -1437,13 +2095,15 @@ EGLSurface wlEglCreateStreamProducerSurfaceHook(EGLDisplay dpy,
     surface->isDestroyed = EGL_FALSE;
     wl_list_init(&surface->oldCtxList);
 
-    wlExternalApiLock();
-    wl_list_insert(&wlEglSurfaceList, &surface->link);
-    wlExternalApiUnlock();
+    wl_list_insert(&display->wlEglSurfaceList, &surface->link);
+    pthread_mutex_unlock(&display->mutex);
+    wlEglReleaseDisplay(display);
 
     return surface;
 
 fail:
+    pthread_mutex_unlock(&display->mutex);
+    wlEglReleaseDisplay(display);
     if (err != EGL_SUCCESS) {
         wlEglSetError(data, err);
     }
@@ -1452,10 +2112,13 @@ fail:
 
 EGLBoolean wlEglDestroySurfaceHook(EGLDisplay dpy, EGLSurface eglSurface)
 {
-    WlEglDisplay *display = (WlEglDisplay*)dpy;
+    WlEglDisplay *display = wlEglAcquireDisplay(dpy);
     EGLint ret = EGL_FALSE;
 
-    wlExternalApiLock();
+    if (!display) {
+        return EGL_FALSE;
+    }
+    pthread_mutex_lock(&display->mutex);
 
     if (display->initCount == 0) {
         wlEglSetError(display->data, EGL_NOT_INITIALIZED);
@@ -1468,7 +2131,8 @@ EGLBoolean wlEglDestroySurfaceHook(EGLDisplay dpy, EGLSurface eglSurface)
     }
 
 done:
-    wlExternalApiUnlock();
+    pthread_mutex_unlock(&display->mutex);
+    wlEglReleaseDisplay(display);
     return ret;
 }
 
@@ -1478,7 +2142,7 @@ EGLBoolean wlEglDestroyAllSurfaces(WlEglDisplay *display)
     WlEglSurface *surface, *next;
     EGLBoolean res = EGL_TRUE;
 
-    wl_list_for_each_safe(surface, next, &wlEglSurfaceList, link) {
+    wl_list_for_each_safe(surface, next, &display->wlEglSurfaceList, link) {
         if (surface->wlEglDpy == display) {
             res = wlEglDestroySurface(display, surface) && res;
         }
