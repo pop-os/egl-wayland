@@ -9,6 +9,7 @@ Build-Depends:
  libwayland-egl-backend-dev,
  meson,
  pkg-config,
+ wayland-protocols,
 Standards-Version: 4.5.0
 Section: libs
 Homepage: https://github.com/NVIDIA/egl-wayland
