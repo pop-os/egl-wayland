@@ -3,4 +3,5 @@ libnvidia-egl-wayland.so.1 libnvidia-egl-wayland1 #MINVER#
  wlEglInitializeSurfaceExport@Base 1:1.1.7
  wlEglPostPresentExport@Base 1:1.1.7
  wlEglPrePresentExport@Base 1:1.1.7
+ wl_drm_interface@Base 1:1.1.9
  wl_eglstream_controller_interface@Base 1:1.1.7
