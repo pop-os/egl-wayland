@@ -1,5 +1,5 @@
 project('wayland-eglstream', 'c',
-        version : '1.1.8',
+        version : '1.1.9',
         default_options : [
           'buildtype=debugoptimized',
           'c_std=gnu99',
@@ -61,4 +61,5 @@ configure_file(
 )
 
 subdir('wayland-eglstream')
+subdir('wayland-drm')
 subdir('src')
