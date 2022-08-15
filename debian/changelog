@@ -2,6 +2,7 @@ egl-wayland (1:1.1.10-1) UNRELEASED; urgency=medium
 
   * New upstream release.
   * control: Add libdrm-dev to build-depends.
+  * symbols: Updated.
 
  -- Timo Aaltonen <tjaalton@debian.org>  Mon, 15 Aug 2022 16:18:00 +0300
 
