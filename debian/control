@@ -4,6 +4,7 @@ Maintainer: Timo Aaltonen <tjaalton@debian.org>
 Build-Depends:
  debhelper-compat (= 12),
  eglexternalplatform-dev,
+ libdrm-dev,
  libegl1-mesa-dev,
  libwayland-dev,
  libwayland-egl-backend-dev,
