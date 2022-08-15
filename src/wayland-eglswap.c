@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014-2019, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2014-2022, NVIDIA CORPORATION. All rights reserved.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -24,7 +24,7 @@
 #include "wayland-eglstream-client-protocol.h"
 #include "wayland-thread.h"
 #include "wayland-egldisplay.h"
-#include "wayland-eglsurface.h"
+#include "wayland-eglsurface-internal.h"
 #include "wayland-eglhandle.h"
 #include "wayland-eglutils.h"
 #include <assert.h>
@@ -64,6 +64,8 @@ EGLBoolean wlEglSwapBuffersWithDamageHook(EGLDisplay eglDisplay, EGLSurface eglS
 
     surface = eglSurface;
 
+    wlEglResizeSurfaceIfRequired(display, data, surface);
+
     if (surface->pendingSwapIntervalUpdate == EGL_TRUE) {
         /* Send request from client to override swapinterval value based on
          * server's swapinterval for overlay compositing
@@ -97,6 +99,16 @@ EGLBoolean wlEglSwapBuffersWithDamageHook(EGLDisplay eglDisplay, EGLSurface eglS
             goto fail_locked;
         }
 
+        if (surface->ctx.useDamageThread) {
+            pthread_mutex_lock(&surface->mutexFrameSync);
+            // Wait for damage thread to submit the
+            // previous frame and generate frame sync
+            while (surface->ctx.framesProduced != surface->ctx.framesProcessed) {
+                pthread_cond_wait(&surface->condFrameSync, &surface->mutexFrameSync);
+            }
+            pthread_mutex_unlock(&surface->mutexFrameSync);
+        }
+
         wlEglWaitFrameSync(surface);
     }
 
@@ -125,10 +137,10 @@ EGLBoolean wlEglSwapBuffersWithDamageHook(EGLDisplay eglDisplay, EGLSurface eglS
         if (surface->ctx.useDamageThread) {
             surface->ctx.framesProduced++;
         } else {
+            wlEglCreateFrameSync(surface);
             res = wlEglSendDamageEvent(surface, surface->wlEventQueue);
         }
     }
-    wlEglCreateFrameSync(surface);
 
 done:
     // Release wlEglSurface lock.
@@ -224,6 +236,7 @@ done:
     return ret;
 }
 
+WL_EXPORT
 EGLBoolean wlEglPrePresentExport(WlEglSurface *surface) {
     WlEglDisplay *display = wlEglAcquireDisplay((WlEglDisplay *)surface->wlEglDpy);
     if (!display) {
@@ -254,6 +267,16 @@ EGLBoolean wlEglPrePresentExport(WlEglSurface *surface) {
     // Acquire wlEglSurface lock.
     pthread_mutex_lock(&surface->mutexLock);
 
+    if (surface->ctx.useDamageThread) {
+        pthread_mutex_lock(&surface->mutexFrameSync);
+        // Wait for damage thread to submit the
+        // previous frame and generate frame sync
+        while (surface->ctx.framesProduced != surface->ctx.framesProcessed) {
+            pthread_cond_wait(&surface->condFrameSync, &surface->mutexFrameSync);
+        }
+        pthread_mutex_unlock(&surface->mutexFrameSync);
+    }
+
     wlEglWaitFrameSync(surface);
 
     // Release wlEglSurface lock.
@@ -263,6 +286,7 @@ EGLBoolean wlEglPrePresentExport(WlEglSurface *surface) {
     return EGL_TRUE;
 }
 
+WL_EXPORT
 EGLBoolean wlEglPostPresentExport(WlEglSurface *surface) {
     WlEglDisplay          *display = wlEglAcquireDisplay((WlEglDisplay *)surface->wlEglDpy);
     WlEglPlatformData     *data    = NULL;
@@ -285,10 +309,9 @@ EGLBoolean wlEglPostPresentExport(WlEglSurface *surface) {
     if (surface->ctx.useDamageThread) {
         surface->ctx.framesProduced++;
     } else {
+        wlEglCreateFrameSync(surface);
         res = wlEglSendDamageEvent(surface, surface->wlEventQueue);
     }
-
-    wlEglCreateFrameSync(surface);
 
     // Release wlEglSurface lock.
     pthread_mutex_unlock(&surface->mutexLock);

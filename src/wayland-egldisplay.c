@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014-2018, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2014-2022, NVIDIA CORPORATION. All rights reserved.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -26,16 +26,23 @@
 #include "linux-dmabuf-unstable-v1-client-protocol.h"
 #include "wayland-eglstream-server.h"
 #include "wayland-thread.h"
-#include "wayland-eglsurface.h"
+#include "wayland-eglsurface-internal.h"
 #include "wayland-eglhandle.h"
 #include "wayland-eglutils.h"
+#include "wayland-drm-client-protocol.h"
+#include "wayland-drm.h"
 #include <string.h>
 #include <stdlib.h>
 #include <assert.h>
+#include <unistd.h>
+#include <fcntl.h>
 
 typedef struct WlServerProtocolsRec {
     EGLBoolean hasEglStream;
     EGLBoolean hasDmaBuf;
+    EGLBoolean hasDrm;
+    struct wl_drm *wldrm;
+    char *drm_name;
 } WlServerProtocols;
 
 /* TODO: Make global display lists hang off platform data */
@@ -64,15 +71,16 @@ EGLBoolean wlEglIsValidNativeDisplayExport(void *data, void *nativeDpy)
 
 EGLBoolean wlEglBindDisplaysHook(void *data, EGLDisplay dpy, void *nativeDpy)
 {
-    /* Retrieve extension string before taking external API lock */
-    const char *exts = ((WlEglPlatformData *)data)->egl.queryString(dpy, EGL_EXTENSIONS);
+    /* Retrieve extension string and device name before taking external API lock */
+    const char *exts = ((WlEglPlatformData *)data)->egl.queryString(dpy, EGL_EXTENSIONS),
+               *dev_name = wl_drm_get_dev_name(data, dpy);
     EGLBoolean res = EGL_FALSE;
 
     wlExternalApiLock();
 
     res = wl_eglstream_display_bind((WlEglPlatformData *)data,
                                     (struct wl_display *)nativeDpy,
-                                    dpy, exts);
+                                    dpy, exts, dev_name);
 
     wlExternalApiUnlock();
 
@@ -241,6 +249,40 @@ static const struct wl_registry_listener registry_listener = {
     registry_handle_global_remove
 };
 
+static void wl_drm_device(void *data, struct wl_drm *wl_drm, const char *name)
+{
+    WlServerProtocols *protocols = (WlServerProtocols *)data;
+    (void) wl_drm;
+
+    protocols->drm_name = strdup(name);
+}
+
+static void wl_drm_authenticated(void *data, struct wl_drm *wl_drm)
+{
+    (void) data;
+    (void) wl_drm;
+}
+static void wl_drm_format(void *data, struct wl_drm *wl_drm, uint32_t format)
+{
+    (void) data;
+    (void) wl_drm;
+    (void) format;
+}
+static void wl_drm_capabilities(void *data, struct wl_drm *wl_drm, uint32_t value)
+{
+    (void) data;
+    (void) wl_drm;
+    (void) value;
+}
+
+static const struct wl_drm_listener drmListener = {
+    .device = wl_drm_device,
+    .authenticated = wl_drm_authenticated,
+    .format = wl_drm_format,
+    .capabilities = wl_drm_capabilities,
+};
+
+
 static void
 registry_handle_global_check_protocols(
                        void *data,
@@ -261,6 +303,12 @@ registry_handle_global_check_protocols(
     if ((strcmp(interface, "zwp_linux_dmabuf_v1") == 0) &&
         (version >= 3)) {
         protocols->hasDmaBuf = EGL_TRUE;
+    }
+
+    if ((strcmp(interface, "wl_drm") == 0) && (version >= 2)) {
+        protocols->hasDrm = EGL_TRUE;
+        protocols->wldrm = wl_registry_bind(registry, name, &wl_drm_interface, 2);
+        wl_drm_add_listener(protocols->wldrm, &drmListener, protocols);
     }
 }
 
@@ -389,8 +437,8 @@ EGLBoolean wlEglTerminateHook(EGLDisplay dpy)
     return res;
 }
 
-static void checkServerProtocols(struct wl_display *nativeDpy,
-                                 WlServerProtocols *protocols)
+static void getServerProtocolsInfo(struct wl_display *nativeDpy,
+                                   WlServerProtocols *protocols)
 {
     struct wl_display     *wrapper      = NULL;
     struct wl_registry    *wlRegistry   = NULL;
@@ -418,6 +466,11 @@ static void checkServerProtocols(struct wl_display *nativeDpy,
                                    protocols);
     if (ret == 0) {
         wl_display_roundtrip_queue(nativeDpy, queue);
+        if (protocols->hasDrm) {
+            wl_display_roundtrip_queue(nativeDpy, queue);
+            /* destroy our wl_drm object */
+            wl_drm_destroy(protocols->wldrm);
+        }
     }
 
     if (queue) {
@@ -438,9 +491,14 @@ EGLDisplay wlEglGetPlatformDisplayExport(void *data,
     WlServerProtocols      protocols;
     EGLint                 numDevices      = 0;
     int                    i               = 0;
+    EGLDeviceEXT          *eglDeviceList   = NULL;
     EGLDeviceEXT           eglDevice       = NULL;
+    EGLDeviceEXT           tmpDev          = NULL;
     EGLint                 err             = EGL_SUCCESS;
     EGLBoolean             useInitRefCount = EGL_FALSE;
+    const char *dev_exts;
+    const char *dev_name;
+    const char *primeRenderOffloadStr;
 
     if (platform != EGL_PLATFORM_WAYLAND_EXT) {
         wlEglSetError(data, EGL_BAD_PARAMETER);
@@ -480,7 +538,6 @@ EGLDisplay wlEglGetPlatformDisplayExport(void *data,
 
     display = calloc(1, sizeof(*display));
     if (!display) {
-        wlExternalApiUnlock();
         err = EGL_BAD_ALLOC;
         goto fail;
     }
@@ -498,7 +555,6 @@ EGLDisplay wlEglGetPlatformDisplayExport(void *data,
     if (!display->nativeDpy) {
         display->nativeDpy = wl_display_connect(NULL);
         if (!display->nativeDpy) {
-            wlExternalApiUnlock();
             err = EGL_BAD_ALLOC;
             goto fail;
         }
@@ -508,26 +564,92 @@ EGLDisplay wlEglGetPlatformDisplayExport(void *data,
     }
 
     memset(&protocols, 0, sizeof(protocols));
-    checkServerProtocols(display->nativeDpy, &protocols);
+    /*
+     * This is where we check the supported protocols on the compositor,
+     * and bind to wl_drm to get the device name.
+     * protocols.drm_name will be allocated here if using wl_drm
+     */
+    getServerProtocolsInfo(display->nativeDpy, &protocols);
 
-    if (!protocols.hasEglStream && !protocols.hasDmaBuf) {
-        wlExternalApiUnlock();
-        goto fail;
+    if (!protocols.hasDrm || (!protocols.hasEglStream && !protocols.hasDmaBuf)) {
+        goto fail_cleanup_protocols;
     }
 
-    if (!pData->egl.queryDevices(1, &eglDevice, &numDevices) || numDevices == 0) {
-        wlExternalApiUnlock();
-        goto fail;
+    /* Get the number of devices available */
+    if (!pData->egl.queryDevices(-1, NULL, &numDevices) || numDevices == 0) {
+        goto fail_cleanup_protocols;
     }
+
+    eglDeviceList = calloc(numDevices, sizeof(*eglDeviceList));
+    if (!eglDeviceList) {
+        goto fail_cleanup_protocols;
+    }
+
+    primeRenderOffloadStr = getenv("__NV_PRIME_RENDER_OFFLOAD");
+    display->primeRenderOffload = primeRenderOffloadStr &&
+        !strcmp(primeRenderOffloadStr, "1");
+
+    /*
+     * Now we need to find an EGLDevice. If __NV_PRIME_RENDER_OFFLOAD=1, we will use the
+     * first NVIDIA GPU returned by eglQueryDevices. Otherwise, if wl_drm is in use, we will
+     * try to find one that matches the device the compositor is using. We know that device
+     * is an nvidia device since we just checked that above.
+     */
+    if (!pData->egl.queryDevices(numDevices, eglDeviceList, &numDevices) || numDevices == 0) {
+        goto fail_cleanup_devices;
+    }
+
+    if (display->primeRenderOffload) {
+        eglDevice = eglDeviceList[0];
+    } else if (protocols.drm_name) {
+        for (int i = 0; i < numDevices; i++) {
+            tmpDev = eglDeviceList[i];
+
+            /*
+             * To check against the wl_drm name, we need to check if we can use
+             * the drm extension
+             */
+            dev_exts = display->data->egl.queryDeviceString(tmpDev,
+                    EGL_EXTENSIONS);
+            if (dev_exts) {
+                if (wlEglFindExtension("EGL_EXT_device_drm_render_node", dev_exts)) {
+                    dev_name =
+                        display->data->egl.queryDeviceString(tmpDev,
+                                EGL_DRM_RENDER_NODE_FILE_EXT);
+
+                    if (dev_name) {
+                        /*
+                         * At this point we have gotten the name from wl_drm, gotten
+                         * the drm node from the EGLDevice. If they match, then
+                         * this is the final device to use, since it is the compositor's
+                         * device.
+                         */
+                        if (strcmp(dev_name, protocols.drm_name) == 0) {
+                            eglDevice = eglDeviceList[0];
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /*
+     * Right now we are pretty much limited to running on the same GPU as the
+     * compositor. If we couldn't find an EGLDevice that has EGL_EXT_device_drm_render_node
+     * and the same DRM device path, then fail.
+     */
+    if (!eglDevice) {
+        goto fail_cleanup_devices;
+    }
+
     display->devDpy = wlGetInternalDisplay(pData, eglDevice);
     if (display->devDpy == NULL) {
-        wlExternalApiUnlock();
-        goto fail;
+        goto fail_cleanup_devices;
     }
 
     if (!wlEglInitializeMutex(&display->mutex)) {
-        wlExternalApiUnlock();
-        goto fail;
+        goto fail_cleanup_devices;
     }
     display->refCount = 1;
     WL_LIST_INIT(&display->wlEglSurfaceList);
@@ -537,10 +659,21 @@ EGLDisplay wlEglGetPlatformDisplayExport(void *data,
     // in wlEglDisplayList.
     wl_list_insert(&wlEglDisplayList, &display->link);
 
+    free(eglDeviceList);
+    if (protocols.drm_name) {
+        free(protocols.drm_name);
+    }
     wlExternalApiUnlock();
     return display;
 
+fail_cleanup_devices:
+    free(eglDeviceList);
+fail_cleanup_protocols:
+    if (protocols.drm_name) {
+        free(protocols.drm_name);
+    }
 fail:
+    wlExternalApiUnlock();
 
     if (display->ownNativeDpy) {
         wl_display_disconnect(display->nativeDpy);
@@ -931,13 +1064,13 @@ const char* wlEglQueryStringExport(void *data,
                                    exts)) {
                 if (wlEglFindExtension("EGL_KHR_stream_cross_process_fd",
                                        exts)) {
-                    res = "EGL_WL_bind_wayland_display "
+                    res = "EGL_EXT_present_opaque EGL_WL_bind_wayland_display "
                         "EGL_WL_wayland_eglstream";
                 } else if (wlEglFindExtension("EGL_NV_stream_consumer_eglimage",
                                               exts) &&
                            wlEglFindExtension("EGL_MESA_image_dma_buf_export",
                                               exts)) {
-                    res = "EGL_WL_bind_wayland_display";
+                    res = "EGL_EXT_present_opaque EGL_WL_bind_wayland_display";
                 }
             }
         }
