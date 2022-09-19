@@ -1,8 +1,8 @@
-egl-wayland (1:1.1.11-1) UNRELEASED; urgency=medium
+egl-wayland (1:1.1.11-1) unstable; urgency=medium
 
   * New upstream release.
 
- -- Timo Aaltonen <tjaalton@debian.org>  Mon, 19 Sep 2022 11:26:45 +0300
+ -- Timo Aaltonen <tjaalton@debian.org>  Mon, 19 Sep 2022 12:25:57 +0300
 
 egl-wayland (1:1.1.10-1) unstable; urgency=medium
 
