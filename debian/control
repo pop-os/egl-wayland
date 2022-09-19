@@ -15,7 +15,7 @@ Standards-Version: 4.5.0
 Section: libs
 Homepage: https://github.com/NVIDIA/egl-wayland
 Vcs-Git: https://salsa.debian.org/debian/egl-wayland.git
-Vcs-Browser: https://salsa.debian.org/debian/egl-wayland.git
+Vcs-Browser: https://salsa.debian.org/debian/egl-wayland
 
 Package: libnvidia-egl-wayland-dev
 Section: libdevel
