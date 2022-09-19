@@ -9,9 +9,6 @@ override_dh_auto_install:
 	install -pm 0644 debian/10_nvidia_wayland.json \
 		debian/tmp/usr/share/egl/egl_external_platform.d/
 
-override_dh_missing:
-	dh_missing --fail-missing
-
 %:
 	dh $@ \
 		--builddirectory=build/ \
