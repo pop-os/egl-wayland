@@ -64,12 +64,11 @@ EGLBoolean wlEglSwapBuffersWithDamageHook(EGLDisplay eglDisplay, EGLSurface eglS
 
     surface = eglSurface;
 
-    wlEglResizeSurfaceIfRequired(display, data, surface);
-
     if (surface->pendingSwapIntervalUpdate == EGL_TRUE) {
         /* Send request from client to override swapinterval value based on
          * server's swapinterval for overlay compositing
          */
+        assert(surface->ctx.wlStreamResource);
         wl_eglstream_display_swap_interval(display->wlStreamDpy,
                                            surface->ctx.wlStreamResource,
                                            surface->swapInterval);
@@ -142,6 +141,10 @@ EGLBoolean wlEglSwapBuffersWithDamageHook(EGLDisplay eglDisplay, EGLSurface eglS
         }
     }
 
+    if (surface->isResized) {
+        wlEglResizeSurface(display, data, surface);
+    }
+
 done:
     // Release wlEglSurface lock.
     pthread_mutex_unlock(&surface->mutexLock);
@@ -205,29 +208,28 @@ EGLBoolean wlEglSwapIntervalHook(EGLDisplay eglDisplay, EGLint interval)
 
     pthread_mutex_lock(&display->mutex);
 
-    /* Check this is a valid wayland EGL surface with a server-side stream
-     * resource before sending the swap interval value to the consumer */
+    /* Check this is a valid wayland EGL surface */
     if (display->initCount == 0 ||
         !wlEglIsWlEglSurfaceForDisplay(display, surface) ||
         (surface->swapInterval == interval) ||
-        (surface->ctx.wlStreamResource == NULL) ||
-        (surface->ctx.eglStream == EGL_NO_STREAM_KHR) ||
-        (data->egl.queryStream(display->devDpy->eglDisplay,
-                               surface->ctx.eglStream,
-                               EGL_STREAM_STATE_KHR,
-                               &state) == EGL_FALSE) ||
-        (state == EGL_STREAM_STATE_DISCONNECTED_KHR))
-    {
+        (surface->ctx.eglStream == EGL_NO_STREAM_KHR)) {
         goto done;
     }
 
     /* Cache interval value so we can reset it upon surface reattach */
     surface->swapInterval = interval;
 
-    /* Set client's pendingSwapIntervalUpdate for updating client's
-     * swapinterval
-     */
-    surface->pendingSwapIntervalUpdate = EGL_TRUE;
+    if (surface->ctx.wlStreamResource &&
+        data->egl.queryStream(display->devDpy->eglDisplay,
+                              surface->ctx.eglStream,
+                              EGL_STREAM_STATE_KHR, &state) &&
+        state != EGL_STREAM_STATE_DISCONNECTED_KHR) {
+        /* Set client's pendingSwapIntervalUpdate for updating client's
+         * swapinterval if the compositor supports wl_eglstream_display
+         * and the surface has a valid server-side stream
+         */
+        surface->pendingSwapIntervalUpdate = EGL_TRUE;
+    }
 
 done:
     pthread_mutex_unlock(&display->mutex);
