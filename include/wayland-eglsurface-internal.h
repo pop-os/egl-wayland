@@ -100,6 +100,11 @@ struct WlEglSurfaceRec {
     EGLint swapInterval;
     EGLint fifoLength;
 
+    int (*present_update_callback)(void*, uint64_t, int);
+    struct wl_event_queue *presentFeedbackQueue;
+    int                   inFlightPresentFeedbackCount;
+    int                   landedPresentFeedbackCount;
+
     struct wl_callback    *throttleCallback;
     struct wl_event_queue *wlEventQueue;
 
@@ -144,11 +149,13 @@ struct WlEglSurfaceRec {
      * eglSwapBuffers(), so just set a resize flag.
      */
     EGLBoolean isResized;
+
+    WlEglDmaBufFeedback feedback;
 };
 
-void wlEglResizeSurface(WlEglDisplay *display,
-                        WlEglPlatformData *pData,
-                        WlEglSurface *surface);
+void wlEglReallocSurface(WlEglDisplay *display,
+                         WlEglPlatformData *pData,
+                         WlEglSurface *surface);
 
 EGLSurface wlEglCreatePlatformWindowSurfaceHook(EGLDisplay dpy,
                                                 EGLConfig config,

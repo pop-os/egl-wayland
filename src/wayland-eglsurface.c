@@ -41,6 +41,7 @@
 #include <poll.h>
 #include <errno.h>
 #include <libdrm/drm_fourcc.h>
+#include <sys/stat.h>
 
 #define WL_EGL_WINDOW_DESTROY_CALLBACK_SINCE 3
 
@@ -60,6 +61,14 @@ static void
 remove_surface_image(WlEglDisplay *display,
                      WlEglSurface *surface,
                      EGLImageKHR eglImage);
+                     
+static EGLBoolean
+validateSurfaceAttrib(EGLAttrib attrib,
+                      EGLAttrib value);
+
+static EGLint
+assignWlEglSurfaceAttribs(WlEglSurface *surface,
+                          const EGLAttrib *attribs); 
 
 EGLBoolean wlEglIsWlEglSurfaceForDisplay(WlEglDisplay *display, WlEglSurface *surface)
 {
@@ -1255,6 +1264,83 @@ EGLint wlEglHandleImageStreamEvents(WlEglSurface *surface)
     return err;
 }
 
+static WlEglDmaBufFormatSet *
+WlEglGetFormatSetForDev(WlEglDmaBufFeedback *feedback, dev_t dev)
+{
+    /* find the dev_t in our feedback's list of tranches */
+    for (int i = 0; i < (int)feedback->numTranches; i++) {
+        if (feedback->tranches[i].drmDev == dev) {
+            return &feedback->tranches[i].formatSet;
+        }
+    }
+
+    return NULL;
+}
+
+/*
+ * TODO: Remove this once an EGL extension exists to query this information.
+ *
+ * This is taken from the GBM library, it looks at the config's sizes and
+ * hardcodes the equivalent DRM format. Eventually we want to be able to query
+ * this directly from the EGLConfig, but since that extension is in the works
+ * we don't want to hold up wayland improvements. This function will be used
+ * until the extension is available.
+ */
+static uint32_t ConfigToDrmFourCC(WlEglDisplay* display, EGLConfig config)
+{
+    EGLDisplay dpy = display->devDpy->eglDisplay;
+    EGLint r, g, b, a;
+    EGLBoolean ret = EGL_TRUE;
+
+    ret &= display->data->egl.getConfigAttrib(dpy,
+                                              config,
+                                              EGL_RED_SIZE,
+                                              &r);
+    ret &= display->data->egl.getConfigAttrib(dpy,
+                                              config,
+                                              EGL_GREEN_SIZE,
+                                              &g);
+    ret &= display->data->egl.getConfigAttrib(dpy,
+                                              config,
+                                              EGL_BLUE_SIZE,
+                                              &b);
+    ret &= display->data->egl.getConfigAttrib(dpy,
+                                              config,
+                                              EGL_ALPHA_SIZE,
+                                              &a);
+
+    if (!ret) {
+        /*
+         * The only reason this could fail is some internal error in the
+         * platform library code or if the application terminated the display
+         * in another thread while this code was running. In either case,
+         * behave as if there is no DRM fourcc format associated with this
+         * config.
+         */
+        return 0; /* DRM_FORMAT_INVALID */
+    }
+
+    /* Handles configs with up to 255 bits per component */
+    assert(a < 256 && g < 256 && b < 256 && a < 256);
+#define PACK_CONFIG(r_, g_, b_, a_) \
+    (((r_) << 24ULL) | ((g_) << 16ULL) | ((b_) << 8ULL) | (a_))
+
+    switch (PACK_CONFIG(r, g, b, a)) {
+    case PACK_CONFIG(8, 8, 8, 0):
+        return DRM_FORMAT_XRGB8888;
+    case PACK_CONFIG(8, 8, 8, 8):
+        return DRM_FORMAT_ARGB8888;
+    case PACK_CONFIG(5, 6, 5, 0):
+        return DRM_FORMAT_RGB565;
+    case PACK_CONFIG(10, 10, 10, 0):
+        return DRM_FORMAT_XRGB2101010;
+    case PACK_CONFIG(10, 10, 10, 2):
+        return DRM_FORMAT_ARGB2101010;
+    default:
+        return 0; /* DRM_FORMAT_INVALID */
+    }
+}
+
 static EGLint create_surface_stream_local(WlEglSurface *surface)
 {
     WlEglDisplay         *display = surface->wlEglDpy;
@@ -1265,10 +1351,77 @@ static EGLint create_surface_stream_local(WlEglSurface *surface)
         EGL_NONE,                   EGL_NONE,
         EGL_NONE
     };
-    /* EGLImage stream consumer will be configured with linear modifier
-     * if __NV_PRIME_RENDER_OFFLOAD was set during initialization. */
-    uint64_t linearModifier = DRM_FORMAT_MOD_LINEAR;
     EGLint err = EGL_SUCCESS;
+    EGLint numModifiers = 0;
+    EGLuint64KHR *modifiers = NULL;
+    EGLint format;
+    WlEglDmaBufFormatSet *formatSet = NULL;
+    WlEglDmaBufFeedback *feedback = NULL;
+
+    /* First do a roundtrip to get the tranches in case the compositor resent them */
+    if (wl_display_roundtrip_queue(display->nativeDpy, display->wlEventQueue) < 0) {
+        err = EGL_BAD_ACCESS;
+        goto fail;
+    }
+
+    /*
+     * Vulkan surfaces will not have an eglConfig set. We will need to address them
+     * separately.
+     */
+    if (surface->eglConfig) {
+        /*
+         * Find the format we are using
+         * For now we use the hardcoded calculation in ConfigToDrmFourCC (which is from
+         * the gbm code). In the future we will have an EGL extension to get this from
+         * a config, and we will switch to that.
+         */
+        format = ConfigToDrmFourCC(display, surface->eglConfig);
+        if (!format) {
+            err = EGL_BAD_ACCESS;
+            goto fail;
+        }
+
+        /* Get our format set, if we have feedback it will be the device's format set */
+        if (display->dmaBufProtocolVersion < 4) {
+            formatSet = &display->formatSet;
+        } else {
+            /*
+             * If the surface has a per-surface feedback object, then use the modifiers
+             * from that. Otherwise use the default feedback.
+             */
+            if (surface->feedback.wlDmaBufFeedback) {
+                feedback = &surface->feedback;
+            } else {
+                feedback = &display->defaultFeedback;
+            }
+
+            formatSet = WlEglGetFormatSetForDev(feedback, display->devDpy->dev);
+            if (!formatSet) {
+                /* try again and see if there is a matching tranche for the render node */
+                formatSet = WlEglGetFormatSetForDev(feedback, display->devDpy->renderNode);
+            }
+
+            /*
+             * If we could not find any modifiers for this device, and if we are
+             * in a prime setup, use the main device's format set. This will allow
+             * us to check if the main device supports the linear modifier.
+             */
+            if (!formatSet && display->primeRenderOffload) {
+                formatSet = WlEglGetFormatSetForDev(feedback, feedback->mainDev);
+            }
+        }
+
+        /* grab the modifier array */
+        if (formatSet) {
+            for (int i = 0; i < (int)formatSet->numFormats; i++) {
+                if (formatSet->dmaBufFormats[i].format == (uint32_t)format) {
+                    modifiers = formatSet->dmaBufFormats[i].modifiers;
+                    numModifiers = formatSet->dmaBufFormats[i].numModifiers;
+                    break;
+                }
+            }
+        }
+    }
 
     /* We don't have any mechanism to check whether the compositor is going to
      * use this surface for composition or not when using local streams, so
@@ -1295,8 +1448,8 @@ static EGLint create_surface_stream_local(WlEglSurface *surface)
     /* Now create the local EGLImage consumer */
     if (!data->egl.streamImageConsumerConnect(dpy,
                                               surface->ctx.eglStream,
-                                              display->primeRenderOffload ? 1 : 0,
-                                              &linearModifier,
+                                              numModifiers,
+                                              modifiers,
                                               NULL)) {
         err = data->egl.getError();
         goto fail;
@@ -1540,6 +1693,73 @@ EGLStreamKHR wlEglGetSurfaceStreamExport(WlEglSurface *surface)
 }
 
 WL_EXPORT
+int wlEglWaitAllPresentationFeedbacksExport(WlEglSurface *surface)
+{
+    int numberOfPresentEvents = 0;
+
+    WlEglDisplay *display = wlEglAcquireDisplay((WlEglDisplay *)surface->wlEglDpy);
+    pthread_mutex_lock(&surface->mutexLock);
+
+    // Destroy all presentation feedback objects in flight
+    if (display->wpPresentation) {
+        assert(surface->landedPresentFeedbackCount == 0);
+
+        while (surface->inFlightPresentFeedbackCount > 0) {
+            const int ret = wl_display_dispatch_queue(display->nativeDpy, surface->presentFeedbackQueue);
+            if (ret < 0) {
+                pthread_mutex_unlock(&surface->mutexLock);
+                wlEglReleaseDisplay(display);
+
+                return ret;
+            }
+        }
+    }
+
+    assert(surface->inFlightPresentFeedbackCount == 0);
+
+    numberOfPresentEvents = surface->landedPresentFeedbackCount;
+    surface->landedPresentFeedbackCount = 0;
+
+    pthread_mutex_unlock(&surface->mutexLock);
+    wlEglReleaseDisplay(display);
+
+    return numberOfPresentEvents;
+}
+
+WL_EXPORT
+int wlEglProcessPresentationFeedbacksExport(WlEglSurface *surface)
+{
+    int numberOfPresentEvents = 0;
+
+    WlEglDisplay *display = wlEglAcquireDisplay((WlEglDisplay *)surface->wlEglDpy);
+    pthread_mutex_lock(&surface->mutexLock);
+
+    if (display->wpPresentation) {
+        int ret = 0;
+
+        assert(surface->landedPresentFeedbackCount == 0);
+        ret = wl_display_dispatch_queue_pending(display->nativeDpy,
+                                                surface->presentFeedbackQueue);
+        if (ret < 0) {
+            pthread_mutex_unlock(&surface->mutexLock);
+            wlEglReleaseDisplay(display);
+
+            return ret;
+        }
+    }
+
+    numberOfPresentEvents = surface->landedPresentFeedbackCount;
+    surface->landedPresentFeedbackCount = 0;
+
+    assert(surface->inFlightPresentFeedbackCount >= 0);
+
+    pthread_mutex_unlock(&surface->mutexLock);
+    wlEglReleaseDisplay(display);
+
+    return numberOfPresentEvents;
+}
+
+WL_EXPORT
 WlEglSurface *wlEglCreateSurfaceExport(EGLDisplay dpy,
                                        int width,
                                        int height,
@@ -1569,6 +1789,12 @@ WlEglSurface *wlEglCreateSurfaceExport(EGLDisplay dpy,
 
     // Create per surface wayland queue
     surface->wlEventQueue = wl_display_create_queue(display->nativeDpy);
+    // Create an event queue for presentation time feedback events if
+    // the presentation time protocol exists
+    if (display->wpPresentation) {
+        surface->presentFeedbackQueue = wl_display_create_queue(display->nativeDpy);
+    }
+
     surface->refCount = 1;
 
     if (!wlEglInitializeMutex(&surface->mutexLock)) {
@@ -1589,6 +1815,9 @@ WlEglSurface *wlEglCreateSurfaceExport(EGLDisplay dpy,
 
     if (create_surface_context(surface) != EGL_SUCCESS) {
         wl_event_queue_destroy(surface->wlEventQueue);
+        if (surface->presentFeedbackQueue) {
+            wl_event_queue_destroy(surface->presentFeedbackQueue);
+        }
         goto fail;
     }
 
@@ -1613,10 +1842,38 @@ fail:
     return NULL;
 }
 
+WL_EXPORT
+WlEglSurface *wlEglCreateSurfaceExport2(EGLDisplay dpy,
+                                        int width,
+                                        int height,
+                                        struct wl_surface *native_surface,
+                                        int fifo_length,
+                                        int (*present_update_callback)(void*, uint64_t, int),
+                                        const EGLAttrib *attribs)
+{
+    WlEglSurface* const surface = wlEglCreateSurfaceExport(dpy,
+                                                           width,
+                                                           height,
+                                                           native_surface,
+                                                           fifo_length);
+    if (!surface)
+    {
+        return NULL;
+    }
+
+    surface->present_update_callback = present_update_callback;
+
+    if (assignWlEglSurfaceAttribs(surface, attribs) != EGL_SUCCESS)
+    {
+        wlEglDestroySurfaceHook(dpy, surface);
+        return NULL;
+    }
+
+    return surface;
+}
+
 void
-wlEglResizeSurface(WlEglDisplay *display,
-                   WlEglPlatformData *pData,
-                   WlEglSurface *surface)
+wlEglReallocSurface(WlEglDisplay *display, WlEglPlatformData *pData, WlEglSurface *surface)
 {
     EGLint err = EGL_SUCCESS;
 
@@ -1632,6 +1889,9 @@ wlEglResizeSurface(WlEglDisplay *display,
     surface->ctx.eglStream = EGL_NO_STREAM_KHR;
     surface->ctx.damageThreadSync = EGL_NO_SYNC_KHR;
     surface->ctx.damageThreadId = (pthread_t)0;
+    surface->feedback.unprocessedFeedback = false;
+
+    display->defaultFeedback.unprocessedFeedback = false;
 
     err = create_surface_context(surface);
     if (err == EGL_SUCCESS) {
@@ -1679,7 +1939,7 @@ resize_callback(struct wl_egl_window *window, void *data)
         (surface->dy != window->dy)) {
             if (surface == pData->egl.getCurrentSurface(EGL_DRAW) ||
                 surface == pData->egl.getCurrentSurface(EGL_READ)) {
-                wlEglResizeSurface(display, pData, surface);
+                wlEglReallocSurface(display, pData, surface);
             } else {
                 surface->isResized = EGL_TRUE;
             }
@@ -1879,18 +2139,7 @@ static EGLBoolean wlEglDestroySurface(EGLDisplay dpy, EGLSurface eglSurface)
                 surface->wlEglWin->destroy_window_callback = NULL;
             }
         }
-    }
 
-    if (surface->throttleCallback != NULL) {
-        wl_callback_destroy(surface->throttleCallback);
-        surface->throttleCallback = NULL;
-    }
-    if (surface->wlEventQueue != NULL) {
-        wl_event_queue_destroy(surface->wlEventQueue);
-        surface->wlEventQueue = NULL;
-    }
-
-    if (!surface->ctx.isOffscreen) {
         wl_list_for_each_safe(ctx, next, &surface->oldCtxList, link) {
             destroy_surface_context(surface, ctx);
             wl_list_remove(&ctx->link);
@@ -1898,6 +2147,19 @@ static EGLBoolean wlEglDestroySurface(EGLDisplay dpy, EGLSurface eglSurface)
         }
 
         free(surface->attribs);
+    }
+
+    if (surface->presentFeedbackQueue != NULL) {
+        wl_event_queue_destroy(surface->presentFeedbackQueue);
+        surface->presentFeedbackQueue = NULL;
+    }
+    if (surface->throttleCallback != NULL) {
+        wl_callback_destroy(surface->throttleCallback);
+        surface->throttleCallback = NULL;
+    }
+    if (surface->wlEventQueue != NULL) {
+        wl_event_queue_destroy(surface->wlEventQueue);
+        surface->wlEventQueue = NULL;
     }
 
     for (i = 0; i < surface->ctx.numStreamImages; i++) {
@@ -2068,6 +2330,30 @@ EGLSurface wlEglCreatePlatformWindowSurfaceHook(EGLDisplay dpy,
     err = assignWlEglSurfaceAttribs(surface, attribs);
     if (err != EGL_SUCCESS) {
         goto fail;
+    }
+
+    /*
+     * If the compositor supports it, then we can request a dmabuf feedback
+     * object for this surface. This will let the compositor give us per-surface
+     * hints about which modifiers to use.
+     */
+    if (display->dmaBufProtocolVersion >= 4) {
+        surface->feedback.wlDmaBufFeedback =
+            zwp_linux_dmabuf_v1_get_surface_feedback(display->wlDmaBuf, surface->wlSurface);
+
+        if (!surface->feedback.wlDmaBufFeedback ||
+            WlEglRegisterFeedback(&surface->feedback)) {
+            err = EGL_BAD_ALLOC;
+            goto fail;
+        }
+        /* Do a roundtrip to get the tranches before calling create_surface_context */
+        if (wl_display_roundtrip_queue(display->nativeDpy, display->wlEventQueue) < 0) {
+            err = EGL_BAD_ALLOC;
+            goto fail;
+        }
+
+        /* We haven't allocated our surface yet, so we can clear this flag. */
+        surface->feedback.unprocessedFeedback = false;
     }
 
     err = create_surface_context(surface);

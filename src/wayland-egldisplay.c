@@ -31,11 +31,13 @@
 #include "wayland-eglutils.h"
 #include "wayland-drm-client-protocol.h"
 #include "wayland-drm.h"
+#include "presentation-time-client-protocol.h"
 #include <string.h>
 #include <stdlib.h>
 #include <assert.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/mman.h>
 
 typedef struct WlServerProtocolsRec {
     EGLBoolean hasEglStream;
@@ -107,18 +109,55 @@ EGLBoolean wlEglUnbindDisplaysHook(EGLDisplay dpy, void *nativeDpy)
 }
 
 static void
-dmabuf_handle_format(void *data,
-                     struct zwp_linux_dmabuf_v1 *dmabuf,
-                     uint32_t format)
+wlEglDestroyFormatSet(WlEglDmaBufFormatSet *set)
 {
-    (void)data;
-    (void)dmabuf;
-    (void)format;
-    /* Only use formats that include an associated modifier */
+    for (unsigned int i = 0; i < set->numFormats; i++) {
+        free(set->dmaBufFormats[i].modifiers);
+    }
+
+    free(set->dmaBufFormats);
 }
 
 static void
-dmabuf_add_format_modifier(WlEglDmaBufFormat *format, const uint64_t modifier)
+wlEglFeedbackResetTranches(WlEglDmaBufFeedback *feedback)
+{
+    if (feedback->numTranches == 0)
+        return;
+
+    wlEglDestroyFormatSet(&feedback->tmpTranche.formatSet);
+    for (int i = 0; i < feedback->numTranches; i++) {
+        wlEglDestroyFormatSet(&feedback->tranches[i].formatSet);
+    }
+    free(feedback->tranches);
+    feedback->tranches = NULL;
+    feedback->numTranches = 0;
+}
+
+#if defined(NV_SUNOS)
+// Solaris uses the obsolete 'caddr_t' type unless _X_OPEN_SOURCE is set.
+// Unfortunately, setting that flag breaks a lot of other code so instead
+// just cast the pointer to the appropriate type.
+//
+// caddr_t is defined in sys/types.h to be char*.
+typedef caddr_t pointer_t;
+#else
+typedef void *pointer_t;
+#endif
+
+static void
+wlEglDestroyFeedback(WlEglDmaBufFeedback *feedback)
+{
+    wlEglFeedbackResetTranches(feedback);
+    munmap((pointer_t)feedback->formatTable.entry,
+           sizeof(feedback->formatTable.entry[0]) * feedback->formatTable.len);
+
+    if (feedback->wlDmaBufFeedback) {
+        zwp_linux_dmabuf_feedback_v1_destroy(feedback->wlDmaBufFeedback);
+    }
+}
+
+static void
+wlEglDmaBufFormatAddModifier(WlEglDmaBufFormat *format, const uint64_t modifier)
 {
     uint64_t *newModifiers;
     uint32_t m;
@@ -144,6 +183,46 @@ dmabuf_add_format_modifier(WlEglDmaBufFormat *format, const uint64_t modifier)
 }
 
 static void
+wlEglFormatSetAdd(WlEglDmaBufFormatSet *set, uint32_t format, const uint64_t modifier)
+{
+    uint32_t f;
+    WlEglDmaBufFormat *newFormats;
+
+    for (f = 0; f < set->numFormats; f++) {
+        if (set->dmaBufFormats[f].format == format) {
+            wlEglDmaBufFormatAddModifier(&set->dmaBufFormats[f], modifier);
+            return;
+        }
+    }
+
+    newFormats = realloc(set->dmaBufFormats,
+            sizeof(set->dmaBufFormats[0]) * (set->numFormats + 1));
+
+    if (!newFormats) {
+        return;
+    }
+
+    newFormats[set->numFormats].format = format;
+    newFormats[set->numFormats].numModifiers = 0;
+    newFormats[set->numFormats].modifiers = NULL;
+    wlEglDmaBufFormatAddModifier(&newFormats[set->numFormats], modifier);
+
+    set->dmaBufFormats = newFormats;
+    set->numFormats++;
+}
+
+static void
+dmabuf_handle_format(void *data,
+                     struct zwp_linux_dmabuf_v1 *dmabuf,
+                     uint32_t format)
+{
+    (void)data;
+    (void)dmabuf;
+    (void)format;
+    /* Only use formats that include an associated modifier */
+}
+
+static void
 dmabuf_handle_modifier(void *data,
                        struct zwp_linux_dmabuf_v1 *dmabuf,
                        uint32_t format,
@@ -151,34 +230,11 @@ dmabuf_handle_modifier(void *data,
                        uint32_t mod_lo)
 {
     WlEglDisplay *display = data;
-    WlEglDmaBufFormat *newFormats;
     const uint64_t modifier = ((uint64_t)mod_hi << 32ULL) | (uint64_t)mod_lo;
-    uint32_t f;
 
     (void)dmabuf;
 
-    for (f = 0; f < display->numFormats; f++) {
-        if (display->dmaBufFormats[f].format == format) {
-            dmabuf_add_format_modifier(&display->dmaBufFormats[f], modifier);
-            return;
-        }
-    }
-
-    newFormats = realloc(display->dmaBufFormats,
-                         sizeof(display->dmaBufFormats[0]) *
-                         (display->numFormats + 1));
-
-    if (!newFormats) {
-        return;
-    }
-
-    newFormats[display->numFormats].format = format;
-    newFormats[display->numFormats].numModifiers = 0;
-    newFormats[display->numFormats].modifiers = NULL;
-    dmabuf_add_format_modifier(&newFormats[display->numFormats], modifier);
-
-    display->dmaBufFormats = newFormats;
-    display->numFormats++;
+    wlEglFormatSetAdd(&display->formatSet, format, modifier);
 }
 
 static const struct zwp_linux_dmabuf_v1_listener dmabuf_listener = {
@@ -186,27 +242,172 @@ static const struct zwp_linux_dmabuf_v1_listener dmabuf_listener = {
     .modifier = dmabuf_handle_modifier,
 };
 
+/*
+ * We need to check if the compositor is resending all of the tranche
+ * information. Each tranche event will call this method to see
+ * if the existing format info should be cleared before refilling.
+ */
 static void
-dmabuf_set_interface(WlEglDisplay *display,
-                     struct wl_registry *registry,
-                     uint32_t name,
-                     uint32_t version)
+dmabuf_feedback_check_reset_tranches(WlEglDmaBufFeedback *feedback)
 {
-    if (version < 3) {
-        /*
-         * Version 3 added format modifier support, which the dmabuf
-         * support in this library relies on.
-         */
+    if (!feedback->feedbackDone)
         return;
-    }
 
-    display->wlDmaBuf = wl_registry_bind(registry,
-                                         name,
-                                         &zwp_linux_dmabuf_v1_interface,
-                                         3);
-    zwp_linux_dmabuf_v1_add_listener(display->wlDmaBuf,
-                                     &dmabuf_listener,
-                                     display);
+    feedback->feedbackDone = false;
+    wlEglFeedbackResetTranches(feedback);
+}
+
+static void
+dmabuf_feedback_main_device(void *data,
+                            struct zwp_linux_dmabuf_feedback_v1 *dmabuf_feedback,
+                            struct wl_array *dev)
+{
+    WlEglDmaBufFeedback *feedback = data;
+    dev_t devid;
+    (void) dmabuf_feedback;
+
+    dmabuf_feedback_check_reset_tranches(feedback);
+
+    assert(dev->size == sizeof(dev_t));
+    memcpy(&devid, dev->data, sizeof(dev_t));
+
+    feedback->mainDev = devid;
+}
+
+static void
+dmabuf_feedback_tranche_target_device(void *data,
+                                      struct zwp_linux_dmabuf_feedback_v1 *dmabuf_feedback,
+                                      struct wl_array *dev)
+{
+    WlEglDmaBufFeedback *feedback = data;
+    (void) dmabuf_feedback;
+
+    dmabuf_feedback_check_reset_tranches(feedback);
+
+    assert(dev->size == sizeof(dev_t));
+    memcpy(&feedback->tmpTranche.drmDev, dev->data, sizeof(dev_t));
+}
+
+static void
+dmabuf_feedback_tranche_flags(void *data,
+                              struct zwp_linux_dmabuf_feedback_v1 *dmabuf_feedback,
+                              uint32_t flags)
+{
+    WlEglDmaBufFeedback *feedback = data;
+    (void) dmabuf_feedback;
+
+    dmabuf_feedback_check_reset_tranches(feedback);
+
+    if (flags & ZWP_LINUX_DMABUF_FEEDBACK_V1_TRANCHE_FLAGS_SCANOUT)
+        feedback->tmpTranche.supportsScanout = true;
+}
+
+static void
+dmabuf_feedback_tranche_formats(void *data,
+                                struct zwp_linux_dmabuf_feedback_v1 *dmabuf_feedback,
+                                struct wl_array *indices)
+{
+    WlEglDmaBufFeedback *feedback = data;
+    WlEglDmaBufTranche *tmp = &feedback->tmpTranche;
+    uint16_t *index;
+    WlEglDmaBufFormatTableEntry *entry;
+    (void) dmabuf_feedback;
+
+    dmabuf_feedback_check_reset_tranches(feedback);
+
+    wl_array_for_each(index, indices) {
+        if (*index >= feedback->formatTable.len) {
+            /*
+             * Index given to us by the compositor is too large to fit in the format table.
+             * This is a compositor bug, just skip it.
+             */
+            continue;
+        }
+
+        /* Look up this format/mod in the format table */
+        entry = &feedback->formatTable.entry[*index];
+
+        /* Add it to the in-progress */
+        wlEglFormatSetAdd(&tmp->formatSet, entry->format, entry->modifier);
+    }
+}
+
+static void
+dmabuf_feedback_tranche_done(void *data,
+                             struct zwp_linux_dmabuf_feedback_v1 *dmabuf_feedback)
+{
+    WlEglDmaBufFeedback *feedback = data;
+    (void) dmabuf_feedback;
+
+    /*
+     * No need to call dmabuf_feedback_check_reset_tranches, the other events should have been
+     * triggered first
+     */
+
+    feedback->numTranches++;
+    feedback->tranches = realloc(feedback->tranches,
+            sizeof(WlEglDmaBufTranche) * feedback->numTranches);
+    assert(feedback->tranches);
+
+    /* copy the temporary tranche into the official array */
+    memcpy(&feedback->tranches[feedback->numTranches - 1],
+           &feedback->tmpTranche, sizeof(WlEglDmaBufTranche));
+
+    /* reset the tranche */
+    memset(&feedback->tmpTranche, 0, sizeof(WlEglDmaBufTranche));
+}
+
+static void
+dmabuf_feedback_done(void *data, struct zwp_linux_dmabuf_feedback_v1 *dmabuf_feedback)
+{
+    WlEglDmaBufFeedback *feedback = data;
+    (void) dmabuf_feedback;
+
+    feedback->feedbackDone = feedback->unprocessedFeedback = true;
+}
+
+_Static_assert(sizeof(WlEglDmaBufFormatTableEntry) == 16,
+        "Validate that this struct's layout wasn't modified by the compiler");
+
+static void
+dmabuf_feedback_format_table(void *data,
+                             struct zwp_linux_dmabuf_feedback_v1 *dmabuf_feedback,
+                             int32_t fd, uint32_t size)
+{
+    WlEglDmaBufFeedback *feedback = data;
+    (void) dmabuf_feedback;
+
+    assert(size % sizeof(WlEglDmaBufFormatTableEntry) == 0);
+    feedback->formatTable.len = size / sizeof(WlEglDmaBufFormatTableEntry);
+
+    feedback->formatTable.entry =
+        (WlEglDmaBufFormatTableEntry *)mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+
+    if (feedback->formatTable.entry == MAP_FAILED) {
+        /*
+         * Could not map the format table: Compositor bug or out of resources
+         */
+        feedback->formatTable.len = 0;
+    }
+}
+
+static const struct zwp_linux_dmabuf_feedback_v1_listener dmabuf_feedback_listener = {
+    .done = dmabuf_feedback_done,
+    .format_table = dmabuf_feedback_format_table,
+    .main_device = dmabuf_feedback_main_device,
+    .tranche_done = dmabuf_feedback_tranche_done,
+    .tranche_target_device = dmabuf_feedback_tranche_target_device,
+    .tranche_formats = dmabuf_feedback_tranche_formats,
+    .tranche_flags = dmabuf_feedback_tranche_flags,
+};
+
+int
+WlEglRegisterFeedback(WlEglDmaBufFeedback *feedback)
+{
+    return zwp_linux_dmabuf_feedback_v1_add_listener(feedback->wlDmaBufFeedback,
+                                                     &dmabuf_feedback_listener,
+                                                     feedback);
 }
 
 static void
@@ -230,7 +431,22 @@ registry_handle_global(void *data,
                                                 version);
         display->wlStreamCtlVer = version;
     } else if (strcmp(interface, "zwp_linux_dmabuf_v1") == 0) {
-        dmabuf_set_interface(display, registry, name, version);
+        /*
+         * Version 3 added format modifier support, which the dmabuf
+         * support in this library relies on.
+         */
+        if (version >= 3) {
+            display->wlDmaBuf = wl_registry_bind(registry,
+                                                 name,
+                                                 &zwp_linux_dmabuf_v1_interface,
+                                                 version > 3 ? 4 : 3);
+        }
+        display->dmaBufProtocolVersion = version;
+    } else if (strcmp(interface, "wp_presentation") == 0) {
+        display->wpPresentation = wl_registry_bind(registry,
+                                                   name,
+                                                   &wp_presentation_interface,
+                                                   version);
     }
 }
 
@@ -412,11 +628,26 @@ static EGLBoolean terminateDisplay(WlEglDisplay *display, EGLBoolean globalTeard
             wl_eglstream_display_destroy(display->wlStreamDpy);
             display->wlStreamDpy = NULL;
         }
+        if (display->wlStreamCtl) {
+            wl_eglstream_controller_destroy(display->wlStreamCtl);
+            display->wlStreamCtl = NULL;
+        }
+        if (display->wpPresentation) {
+            wp_presentation_destroy(display->wpPresentation);
+            display->wpPresentation = NULL;
+        }
         if (display->wlEventQueue) {
             wl_event_queue_destroy(display->wlEventQueue);
             display->wlEventQueue = NULL;
         }
+        if (display->wlDmaBuf) {
+            zwp_linux_dmabuf_v1_destroy(display->wlDmaBuf);
+            display->wlDmaBuf = NULL;
+        }
     }
+
+    wlEglDestroyFormatSet(&display->formatSet);
+    wlEglDestroyFeedback(&display->defaultFeedback);
 
     return EGL_TRUE;
 }
@@ -473,11 +704,11 @@ static void getServerProtocolsInfo(struct wl_display *nativeDpy,
         }
     }
 
+    if (wlRegistry) {
+        wl_registry_destroy(wlRegistry);
+    }
     if (queue) {
         wl_event_queue_destroy(queue);
-    }
-    if (wlRegistry) {
-       wl_registry_destroy(wlRegistry);
     }
 }
 
@@ -488,17 +719,17 @@ EGLDisplay wlEglGetPlatformDisplayExport(void *data,
 {
     WlEglPlatformData     *pData           = (WlEglPlatformData *)data;
     WlEglDisplay          *display         = NULL;
-    WlServerProtocols      protocols;
+    WlServerProtocols      protocols       = {};
     EGLint                 numDevices      = 0;
     int                    i               = 0;
     EGLDeviceEXT          *eglDeviceList   = NULL;
     EGLDeviceEXT           eglDevice       = NULL;
-    EGLDeviceEXT           tmpDev          = NULL;
     EGLint                 err             = EGL_SUCCESS;
     EGLBoolean             useInitRefCount = EGL_FALSE;
-    const char *dev_exts;
-    const char *dev_name;
     const char *primeRenderOffloadStr;
+    EGLDeviceEXT serverDevice = EGL_NO_DEVICE_EXT;
+    EGLDeviceEXT requestedDevice = EGL_NO_DEVICE_EXT;
+    EGLBoolean usePrimeRenderOffload = EGL_FALSE;
 
     if (platform != EGL_PLATFORM_WAYLAND_EXT) {
         wlEglSetError(data, EGL_BAD_PARAMETER);
@@ -517,6 +748,12 @@ EGLDisplay wlEglGetPlatformDisplayExport(void *data,
                     wlEglSetError(data, EGL_BAD_ATTRIBUTE);
                     return EGL_NO_DISPLAY;
                 }
+            } else if (attribs[i] == EGL_DEVICE_EXT) {
+                requestedDevice = (EGLDeviceEXT) attribs[i + 1];
+                if (requestedDevice == EGL_NO_DEVICE_EXT) {
+                    wlEglSetError(data, EGL_BAD_DEVICE_EXT);
+                    return EGL_NO_DISPLAY;
+                }
             } else {
                 wlEglSetError(data, EGL_BAD_ATTRIBUTE);
                 return EGL_NO_DISPLAY;
@@ -530,7 +767,8 @@ EGLDisplay wlEglGetPlatformDisplayExport(void *data,
     wl_list_for_each(display, &wlEglDisplayList, link) {
         if ((display->nativeDpy == nativeDpy ||
             (!nativeDpy && display->ownNativeDpy))
-            && display->useInitRefCount == useInitRefCount) {
+            && display->useInitRefCount == useInitRefCount
+            && display->requestedDevice == requestedDevice) {
             wlExternalApiUnlock();
             return (EGLDisplay)display;
         }
@@ -546,6 +784,7 @@ EGLDisplay wlEglGetPlatformDisplayExport(void *data,
 
     display->nativeDpy   = nativeDpy;
     display->useInitRefCount = useInitRefCount;
+    display->requestedDevice = requestedDevice;
 
     /* If default display is requested, create a new Wayland display connection
      * and its corresponding internal EGLDisplay. Otherwise, check for existing
@@ -563,7 +802,6 @@ EGLDisplay wlEglGetPlatformDisplayExport(void *data,
         wl_display_dispatch_pending(display->nativeDpy);
     }
 
-    memset(&protocols, 0, sizeof(protocols));
     /*
      * This is where we check the supported protocols on the compositor,
      * and bind to wl_drm to get the device name.
@@ -572,22 +810,18 @@ EGLDisplay wlEglGetPlatformDisplayExport(void *data,
     getServerProtocolsInfo(display->nativeDpy, &protocols);
 
     if (!protocols.hasDrm || (!protocols.hasEglStream && !protocols.hasDmaBuf)) {
-        goto fail_cleanup_protocols;
+        goto fail;
     }
 
     /* Get the number of devices available */
     if (!pData->egl.queryDevices(-1, NULL, &numDevices) || numDevices == 0) {
-        goto fail_cleanup_protocols;
+        goto fail;
     }
 
     eglDeviceList = calloc(numDevices, sizeof(*eglDeviceList));
     if (!eglDeviceList) {
-        goto fail_cleanup_protocols;
+        goto fail;
     }
-
-    primeRenderOffloadStr = getenv("__NV_PRIME_RENDER_OFFLOAD");
-    display->primeRenderOffload = primeRenderOffloadStr &&
-        !strcmp(primeRenderOffloadStr, "1");
 
     /*
      * Now we need to find an EGLDevice. If __NV_PRIME_RENDER_OFFLOAD=1, we will use the
@@ -596,60 +830,124 @@ EGLDisplay wlEglGetPlatformDisplayExport(void *data,
      * is an nvidia device since we just checked that above.
      */
     if (!pData->egl.queryDevices(numDevices, eglDeviceList, &numDevices) || numDevices == 0) {
-        goto fail_cleanup_devices;
+        goto fail;
     }
 
-    if (display->primeRenderOffload) {
-        eglDevice = eglDeviceList[0];
-    } else if (protocols.drm_name) {
-        for (int i = 0; i < numDevices; i++) {
-            tmpDev = eglDeviceList[i];
+    primeRenderOffloadStr = getenv("__NV_PRIME_RENDER_OFFLOAD");
+    if (primeRenderOffloadStr && !strcmp(primeRenderOffloadStr, "1")) {
+        usePrimeRenderOffload = EGL_TRUE;
+    }
+
+    // Try to find the device that the compositor is running on.
+    if (protocols.drm_name) {
+        for (i = 0; i < numDevices; i++) {
+            EGLDeviceEXT tmpDev = eglDeviceList[i];
 
             /*
              * To check against the wl_drm name, we need to check if we can use
              * the drm extension
              */
-            dev_exts = display->data->egl.queryDeviceString(tmpDev,
+            const char *dev_exts = display->data->egl.queryDeviceString(tmpDev,
                     EGL_EXTENSIONS);
-            if (dev_exts) {
-                if (wlEglFindExtension("EGL_EXT_device_drm_render_node", dev_exts)) {
-                    dev_name =
-                        display->data->egl.queryDeviceString(tmpDev,
-                                EGL_DRM_RENDER_NODE_FILE_EXT);
+            if (dev_exts && wlEglFindExtension("EGL_EXT_device_drm_render_node", dev_exts)) {
+                const char *dev_name = display->data->egl.queryDeviceString(tmpDev,
+                            EGL_DRM_RENDER_NODE_FILE_EXT);
 
-                    if (dev_name) {
-                        /*
-                         * At this point we have gotten the name from wl_drm, gotten
-                         * the drm node from the EGLDevice. If they match, then
-                         * this is the final device to use, since it is the compositor's
-                         * device.
-                         */
-                        if (strcmp(dev_name, protocols.drm_name) == 0) {
-                            eglDevice = eglDeviceList[0];
-                            break;
-                        }
+                if (dev_name) {
+                    /*
+                     * At this point we have gotten the name from wl_drm, gotten
+                     * the drm node from the EGLDevice. If they match, then
+                     * this is the final device to use, since it is the compositor's
+                     * device.
+                     */
+                    if (strcmp(dev_name, protocols.drm_name) == 0) {
+                        serverDevice = tmpDev;
+                        break;
                     }
                 }
             }
         }
     }
 
-    /*
-     * Right now we are pretty much limited to running on the same GPU as the
-     * compositor. If we couldn't find an EGLDevice that has EGL_EXT_device_drm_render_node
-     * and the same DRM device path, then fail.
-     */
-    if (!eglDevice) {
-        goto fail_cleanup_devices;
+    // By default, use whatever device the server is using.
+    eglDevice = serverDevice;
+
+    if (requestedDevice != EGL_NO_DEVICE_EXT) {
+        // If the app requested a specific device, then use it.
+        // Make sure that the requested device is a valid EGLDeviceEXT handle.
+        EGLBoolean found = EGL_FALSE;
+        for (i = 0; i < numDevices; i++) {
+            if (eglDeviceList[i] == requestedDevice) {
+                found = EGL_TRUE;
+                break;
+            }
+        }
+        if (found) {
+            if (serverDevice != EGL_NO_DEVICE_EXT && serverDevice != requestedDevice) {
+                /*
+                 * Don't allow NV -> NV offloading, because it doesn't
+                 * currently work in Weston or Mutter. Weston may try to use
+                 * the images as scanout buffers (which doesn't work), and
+                 * Mutter doesn't correctly handle external-only images.
+                 *
+                 * Without proper compositor support, This could still work if
+                 * the client either does a blit between devices into something
+                 * that the compositor can consume, or reads back the image
+                 * into an SHM buffer.
+                 */
+                err = EGL_BAD_MATCH;
+                goto fail;
+            }
+
+            eglDevice = requestedDevice;
+        } else if (!usePrimeRenderOffload) {
+            /*
+             * The EGL_DEVICE_EXT attribute doesn't match any NVIDIA device,
+             * but it might match a non-NV device. If the user requested GPU
+             * offloading, then we'll pick an NVIDIA device below. Otherwise,
+             * fail here so that another driver can handle it.
+             *
+             * We'll generate an EGL_BAD_MATCH error in this case --
+             * technically, it should be EGL_BAD_DEVICE_EXT if the device is
+             * not valid, or EGL_BAD_MATCH if the device is valid but we can't
+             * use it. We have no way to know if this is a valid device from
+             * Mesa, though, but assume that it is so that a non-buggy
+             * application can get useful feedback.
+             */
+            err = EGL_BAD_MATCH;
+            goto fail;
+        }
     }
+
+    if (eglDevice == EGL_NO_DEVICE_EXT && usePrimeRenderOffload) {
+        /*
+         * If __NV_PRIME_RENDER_OFFLOAD is set, then use an NVIDIA device. It
+         * doesn't matter which one.
+         */
+        eglDevice = eglDeviceList[0];
+    }
+
+    if (eglDevice == EGL_NO_DEVICE_EXT) {
+        // If we couldn't find a device to render on, then fail.
+        goto fail;
+    }
+
+    if (eglDevice != serverDevice) {
+        /*
+         * If we're rendering with a different device than the compositor is
+         * using, then we'll need to use the PRIME offloading path.
+         */
+        display->primeRenderOffload = EGL_TRUE;
+    }
+
 
     display->devDpy = wlGetInternalDisplay(pData, eglDevice);
     if (display->devDpy == NULL) {
-        goto fail_cleanup_devices;
+        goto fail;
     }
 
     if (!wlEglInitializeMutex(&display->mutex)) {
-        goto fail_cleanup_devices;
+        goto fail;
     }
     display->refCount = 1;
     WL_LIST_INIT(&display->wlEglSurfaceList);
@@ -666,14 +964,11 @@ EGLDisplay wlEglGetPlatformDisplayExport(void *data,
     wlExternalApiUnlock();
     return display;
 
-fail_cleanup_devices:
-    free(eglDeviceList);
-fail_cleanup_protocols:
-    if (protocols.drm_name) {
-        free(protocols.drm_name);
-    }
 fail:
     wlExternalApiUnlock();
+
+    free(eglDeviceList);
+    free(protocols.drm_name);
 
     if (display->ownNativeDpy) {
         wl_display_disconnect(display->nativeDpy);
@@ -754,27 +1049,44 @@ EGLBoolean wlEglInitializeHook(EGLDisplay dpy, EGLint *major, EGLint *minor)
     }
 
     if (display->wlStreamDpy) {
-        /* Listen to wl_eglstream_display events and make another roundtrip so we
-         * catch any bind-related event (e.g. server capabilities)
-         */
+        /* Listen to wl_eglstream_display events */
         ret = wl_eglstream_display_add_listener(display->wlStreamDpy,
                                                 &eglstream_display_listener,
                                                 display);
-        if (ret == 0) {
-            ret = wl_display_roundtrip_queue(display->nativeDpy,
-                                             display->wlEventQueue);
+    } else if (display->wlDmaBuf) {
+        ret = zwp_linux_dmabuf_v1_add_listener(display->wlDmaBuf,
+                                               &dmabuf_listener,
+                                               display);
+
+        if (ret == 0 && display->dmaBufProtocolVersion >= 4) {
+            /* Since the compositor supports it, opt into surface format feedback */
+            display->defaultFeedback.wlDmaBufFeedback =
+                zwp_linux_dmabuf_v1_get_default_feedback(display->wlDmaBuf);
+            if (display->defaultFeedback.wlDmaBufFeedback) {
+                ret = WlEglRegisterFeedback(&display->defaultFeedback);
+            }
         }
-        if (ret < 0) {
-            err = EGL_BAD_ALLOC;
-            goto fail;
-        }
-    } else if (!display->wlDmaBuf) {
+    }
+
+    if (ret < 0 || !(display->wlStreamDpy || display->wlDmaBuf)) {
         /* This library requires either the EGLStream or dma-buf protocols to
          * present content to the Wayland compositor.
          */
         err = EGL_BAD_ALLOC;
         goto fail;
     }
+
+    /*
+     * Make another roundtrip so we catch any bind-related event (e.g. server capabilities)
+     */
+    ret = wl_display_roundtrip_queue(display->nativeDpy, display->wlEventQueue);
+    if (ret < 0) {
+        err = EGL_BAD_ALLOC;
+        goto fail;
+    }
+
+    /* We haven't created any surfaces yet, so no need to reallocate. */
+    display->defaultFeedback.unprocessedFeedback = false;
 
     if (major != NULL) {
         *major = display->devDpy->major;
@@ -1028,7 +1340,7 @@ const char* wlEglQueryStringExport(void *data,
 
     switch (name) {
     case EGL_EXT_PLATFORM_PLATFORM_CLIENT_EXTENSIONS:
-        res = isEGL15 ? "EGL_KHR_platform_wayland EGL_EXT_platform_wayland" :
+        res = isEGL15 ? "EGL_KHR_platform_wayland EGL_EXT_platform_wayland EGL_EXT_explicit_device" :
                         "EGL_EXT_platform_wayland";
         break;
 
@@ -1036,7 +1348,7 @@ const char* wlEglQueryStringExport(void *data,
         if (dpy == EGL_NO_DISPLAY) {
             /* This should return all client extensions, which for now is
              * equivalent to EXTERNAL_PLATFORM_CLIENT_EXTENSIONS */
-            res = isEGL15 ? "EGL_KHR_platform_wayland EGL_EXT_platform_wayland" :
+            res = isEGL15 ? "EGL_KHR_platform_wayland EGL_EXT_platform_wayland EGL_EXT_explicit_device" :
                             "EGL_EXT_platform_wayland";
         } else {
             /*
