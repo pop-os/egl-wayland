@@ -14,6 +14,7 @@ libnvidia_egl_wayland_la_CFLAGS +=      \
     $(PTHREAD_CFLAGS)                   \
     $(EGL_EXTERNAL_PLATFORM_CFLAGS)     \
     $(WAYLAND_CFLAGS)                   \
+    $(LIBDRM_CFLAGS)                    \
     $(COMPILER_FLAG_VISIBILITY_HIDDEN)
 
 # Make sure we don't use deprecated stuff
@@ -24,6 +25,7 @@ libnvidia_egl_wayland_la_LDFLAGS =                                              
     -shared                                                                                                               \
     -Wl,-Bsymbolic                                                                                                        \
     $(WAYLAND_LIBS)                                                                                                       \
+    $(LIBDRM_LIBS)                                                                                                        \
     -version-number $(WAYLAND_EXTERNAL_MAJOR_VERSION):$(WAYLAND_EXTERNAL_MINOR_VERSION):$(WAYLAND_EXTERNAL_MICRO_VERSION) \
     $(LINKER_FLAG_NO_UNDEFINED)
 
@@ -39,6 +41,21 @@ libnvidia_egl_wayland_la_SOURCES =                            \
     src/wayland-eglhandle.c                                   \
     src/wayland-drm.c                                         \
     src/wayland-external-exports.c
+
+libnvidia_egl_wayland_la_SOURCES += \
+    include/wayland-drm.h                 \
+    include/wayland-egldevice.h           \
+    include/wayland-egldisplay.h          \
+    include/wayland-eglhandle.h           \
+    include/wayland-eglstream.h           \
+    include/wayland-eglstream-server.h    \
+    include/wayland-eglsurface.h          \
+    include/wayland-eglsurface-internal.h \
+    include/wayland-eglswap.h             \
+    include/wayland-eglutils.h            \
+    include/wayland-external-exports.h    \
+    include/wayland-thread.h              \
+    wayland-egl/wayland-egl-ext.h
 
 libnvidia_egl_wayland_la_built_public_protocols =             \
     wayland-eglstream/wayland-eglstream-controller-protocol.c \

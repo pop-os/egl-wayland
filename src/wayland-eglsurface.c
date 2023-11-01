@@ -1265,12 +1265,18 @@ EGLint wlEglHandleImageStreamEvents(WlEglSurface *surface)
 }
 
 static WlEglDmaBufFormatSet *
-WlEglGetFormatSetForDev(WlEglDmaBufFeedback *feedback, dev_t dev)
+WlEglGetFormatSetForDev(WlEglDmaBufFeedback *feedback, dev_t dev, uint32_t format)
 {
     /* find the dev_t in our feedback's list of tranches */
     for (int i = 0; i < (int)feedback->numTranches; i++) {
         if (feedback->tranches[i].drmDev == dev) {
-            return &feedback->tranches[i].formatSet;
+            /* check if this tranche contains our format */
+            WlEglDmaBufFormatSet *formatSet = &feedback->tranches[i].formatSet;
+            for (int j = 0; j < (int)formatSet->numFormats; ++j) {
+                if (formatSet->dmaBufFormats[j].format == format) {
+                    return formatSet;
+                }
+            }
         }
     }
 
@@ -1354,15 +1360,9 @@ static EGLint create_surface_stream_local(WlEglSurface *surface)
     EGLint err = EGL_SUCCESS;
     EGLint numModifiers = 0;
     EGLuint64KHR *modifiers = NULL;
-    EGLint format;
+    uint32_t format;
     WlEglDmaBufFormatSet *formatSet = NULL;
     WlEglDmaBufFeedback *feedback = NULL;
-
-    /* First do a roundtrip to get the tranches in case the compositor resent them */
-    if (wl_display_roundtrip_queue(display->nativeDpy, display->wlEventQueue) < 0) {
-        err = EGL_BAD_ACCESS;
-        goto fail;
-    }
 
     /*
      * Vulkan surfaces will not have an eglConfig set. We will need to address them
@@ -1395,10 +1395,10 @@ static EGLint create_surface_stream_local(WlEglSurface *surface)
                 feedback = &display->defaultFeedback;
             }
 
-            formatSet = WlEglGetFormatSetForDev(feedback, display->devDpy->dev);
+            formatSet = WlEglGetFormatSetForDev(feedback, display->devDpy->dev, format);
             if (!formatSet) {
                 /* try again and see if there is a matching tranche for the render node */
-                formatSet = WlEglGetFormatSetForDev(feedback, display->devDpy->renderNode);
+                formatSet = WlEglGetFormatSetForDev(feedback, display->devDpy->renderNode, format);
             }
 
             /*
@@ -1407,14 +1407,14 @@ static EGLint create_surface_stream_local(WlEglSurface *surface)
              * us to check if the main device supports the linear modifier.
              */
             if (!formatSet && display->primeRenderOffload) {
-                formatSet = WlEglGetFormatSetForDev(feedback, feedback->mainDev);
+                formatSet = WlEglGetFormatSetForDev(feedback, feedback->mainDev, format);
             }
         }
 
         /* grab the modifier array */
         if (formatSet) {
             for (int i = 0; i < (int)formatSet->numFormats; i++) {
-                if (formatSet->dmaBufFormats[i].format == (uint32_t)format) {
+                if (formatSet->dmaBufFormats[i].format == format) {
                     modifiers = formatSet->dmaBufFormats[i].modifiers;
                     numModifiers = formatSet->dmaBufFormats[i].numModifiers;
                     break;
@@ -2149,6 +2149,8 @@ static EGLBoolean wlEglDestroySurface(EGLDisplay dpy, EGLSurface eglSurface)
         free(surface->attribs);
     }
 
+    wlEglDestroyFeedback(&surface->feedback);
+
     if (surface->presentFeedbackQueue != NULL) {
         wl_event_queue_destroy(surface->presentFeedbackQueue);
         surface->presentFeedbackQueue = NULL;
@@ -2157,6 +2159,8 @@ static EGLBoolean wlEglDestroySurface(EGLDisplay dpy, EGLSurface eglSurface)
         wl_callback_destroy(surface->throttleCallback);
         surface->throttleCallback = NULL;
     }
+
+    /* all proxies using the queue must be destroyed first! */
     if (surface->wlEventQueue != NULL) {
         wl_event_queue_destroy(surface->wlEventQueue);
         surface->wlEventQueue = NULL;
@@ -2338,8 +2342,13 @@ EGLSurface wlEglCreatePlatformWindowSurfaceHook(EGLDisplay dpy,
      * hints about which modifiers to use.
      */
     if (display->dmaBufProtocolVersion >= 4) {
+        struct zwp_linux_dmabuf_v1 *wrapper = wl_proxy_create_wrapper(display->wlDmaBuf);
+        wl_proxy_set_queue((struct wl_proxy *)wrapper, surface->wlEventQueue);
+
         surface->feedback.wlDmaBufFeedback =
-            zwp_linux_dmabuf_v1_get_surface_feedback(display->wlDmaBuf, surface->wlSurface);
+            zwp_linux_dmabuf_v1_get_surface_feedback(wrapper, surface->wlSurface);
+
+        wl_proxy_wrapper_destroy(wrapper);
 
         if (!surface->feedback.wlDmaBufFeedback ||
             WlEglRegisterFeedback(&surface->feedback)) {
@@ -2347,7 +2356,7 @@ EGLSurface wlEglCreatePlatformWindowSurfaceHook(EGLDisplay dpy,
             goto fail;
         }
         /* Do a roundtrip to get the tranches before calling create_surface_context */
-        if (wl_display_roundtrip_queue(display->nativeDpy, display->wlEventQueue) < 0) {
+        if (wl_display_roundtrip_queue(display->nativeDpy, surface->wlEventQueue) < 0) {
             err = EGL_BAD_ALLOC;
             goto fail;
         }

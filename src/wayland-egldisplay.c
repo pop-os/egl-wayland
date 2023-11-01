@@ -38,6 +38,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <xf86drm.h>
 
 typedef struct WlServerProtocolsRec {
     EGLBoolean hasEglStream;
@@ -144,7 +145,7 @@ typedef caddr_t pointer_t;
 typedef void *pointer_t;
 #endif
 
-static void
+void
 wlEglDestroyFeedback(WlEglDmaBufFeedback *feedback)
 {
     wlEglFeedbackResetTranches(feedback);
@@ -619,6 +620,9 @@ static EGLBoolean terminateDisplay(WlEglDisplay *display, EGLBoolean globalTeard
      * destroy the display connection itself */
     wlEglDestroyAllSurfaces(display);
 
+    wlEglDestroyFormatSet(&display->formatSet);
+    wlEglDestroyFeedback(&display->defaultFeedback);
+
     if (!globalTeardown || display->ownNativeDpy) {
         if (display->wlRegistry) {
             wl_registry_destroy(display->wlRegistry);
@@ -636,18 +640,16 @@ static EGLBoolean terminateDisplay(WlEglDisplay *display, EGLBoolean globalTeard
             wp_presentation_destroy(display->wpPresentation);
             display->wpPresentation = NULL;
         }
-        if (display->wlEventQueue) {
-            wl_event_queue_destroy(display->wlEventQueue);
-            display->wlEventQueue = NULL;
-        }
         if (display->wlDmaBuf) {
             zwp_linux_dmabuf_v1_destroy(display->wlDmaBuf);
             display->wlDmaBuf = NULL;
         }
+        /* all proxies using the queue must be destroyed first! */
+        if (display->wlEventQueue) {
+            wl_event_queue_destroy(display->wlEventQueue);
+            display->wlEventQueue = NULL;
+        }
     }
-
-    wlEglDestroyFormatSet(&display->formatSet);
-    wlEglDestroyFeedback(&display->defaultFeedback);
 
     return EGL_TRUE;
 }
@@ -712,6 +714,70 @@ static void getServerProtocolsInfo(struct wl_display *nativeDpy,
     }
 }
 
+static EGLBoolean checkNvidiaDrmDevice(WlServerProtocols *protocols)
+{
+    int fd = -1;
+    EGLBoolean result = EGL_FALSE;
+    drmVersion *version = NULL;
+    drmDevice *dev = NULL;
+
+    if (protocols->drm_name == NULL) {
+        goto done;
+    }
+
+    fd = open(protocols->drm_name, O_RDWR);
+    if (fd < 0) {
+        goto done;
+    }
+
+    if (drmGetDevice(fd, &dev) == 0) {
+        if (dev->available_nodes & (1 << DRM_NODE_RENDER)) {
+            // Make sure that drm_name is the path to the render node, which is
+            // what wlEglGetPlatformDisplayExport checks for.
+            if (strcmp(protocols->drm_name, dev->nodes[DRM_NODE_RENDER]) != 0) {
+                free(protocols->drm_name);
+                protocols->drm_name = strdup(dev->nodes[DRM_NODE_RENDER]);
+                if (protocols->drm_name == NULL) {
+                    goto done;
+                }
+            }
+        }
+
+        /*
+         * Since we've already called drmGetDevice anyway, if this is a PCI
+         * device, then check if the vendor ID is for NVIDIA. If this is a
+         * Tegra device, though, then it won't be a PCI device, so we'll need
+         * to call drmGetVesion and look at the driver name instead.
+         */
+        if (dev->bustype == DRM_BUS_PCI && dev->deviceinfo.pci->vendor_id == 0x10de) {
+            result = EGL_TRUE;
+        }
+    }
+
+    if (!result) {
+        version = drmGetVersion(fd);
+        if (version != NULL && version->name != NULL) {
+            if (strcmp(version->name, "nvidia-drm") == 0
+                    || strcmp(version->name, "tegra-udrm") == 0
+                    || strcmp(version->name, "tegra") == 0) {
+                result = EGL_TRUE;
+            }
+        }
+    }
+
+done:
+    if (version != NULL) {
+        drmFreeVersion(version);
+    }
+    if (dev != NULL) {
+        drmFreeDevice(&dev);
+    }
+    if (fd >= 0) {
+        close(fd);
+    }
+    return result;
+}
+
 EGLDisplay wlEglGetPlatformDisplayExport(void *data,
                                          EGLenum platform,
                                          void *nativeDpy,
@@ -730,6 +796,7 @@ EGLDisplay wlEglGetPlatformDisplayExport(void *data,
     EGLDeviceEXT serverDevice = EGL_NO_DEVICE_EXT;
     EGLDeviceEXT requestedDevice = EGL_NO_DEVICE_EXT;
     EGLBoolean usePrimeRenderOffload = EGL_FALSE;
+    EGLBoolean isServerNV;
 
     if (platform != EGL_PLATFORM_WAYLAND_EXT) {
         wlEglSetError(data, EGL_BAD_PARAMETER);
@@ -802,12 +869,34 @@ EGLDisplay wlEglGetPlatformDisplayExport(void *data,
         wl_display_dispatch_pending(display->nativeDpy);
     }
 
+    primeRenderOffloadStr = getenv("__NV_PRIME_RENDER_OFFLOAD");
+    if (primeRenderOffloadStr && !strcmp(primeRenderOffloadStr, "1")) {
+        usePrimeRenderOffload = EGL_TRUE;
+    }
+
     /*
      * This is where we check the supported protocols on the compositor,
      * and bind to wl_drm to get the device name.
      * protocols.drm_name will be allocated here if using wl_drm
      */
     getServerProtocolsInfo(display->nativeDpy, &protocols);
+
+    // Check if the server is running on an NVIDIA device. This will also make
+    // sure that the device node that we're looking at is a render node,
+    // regardless of which node the server sends back.
+    isServerNV = checkNvidiaDrmDevice(&protocols);
+    if (!usePrimeRenderOffload && requestedDevice == EGL_NO_DEVICE_EXT) {
+        /*
+         * We're not configured to use any sort of GPU offloading, so we only
+         * support this display if the server is running on an NVIDIA GPU. Do
+         * this early, before we call eglQueryDevicesEXT. eglQueryDevicesEXT
+         * might have to power on the GPU's, which can be very slow.
+         */
+        if (!isServerNV) {
+            err = EGL_SUCCESS;
+            goto fail;
+        }
+    }
 
     if (!protocols.hasDrm || (!protocols.hasEglStream && !protocols.hasDmaBuf)) {
         goto fail;
@@ -831,11 +920,6 @@ EGLDisplay wlEglGetPlatformDisplayExport(void *data,
      */
     if (!pData->egl.queryDevices(numDevices, eglDeviceList, &numDevices) || numDevices == 0) {
         goto fail;
-    }
-
-    primeRenderOffloadStr = getenv("__NV_PRIME_RENDER_OFFLOAD");
-    if (primeRenderOffloadStr && !strcmp(primeRenderOffloadStr, "1")) {
-        usePrimeRenderOffload = EGL_TRUE;
     }
 
     // Try to find the device that the compositor is running on.
