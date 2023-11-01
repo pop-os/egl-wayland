@@ -1,3 +1,9 @@
+egl-wayland (1:1.1.13-1pop1) jammy; urgency=medium
+
+  * Update to 1.1.13
+
+ -- Michael Murphy <michael@mmurphy.dev>  Wed, 01 Nov 2023 12:16:37 +0100
+
 egl-wayland (1:1.1.12-1pop1) jammy; urgency=medium
 
   * Update to 1.1.12
