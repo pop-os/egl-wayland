@@ -1,0 +1,2 @@
+usr/lib/*/libnvidia-egl-wayland.so.*
+usr/share/egl/egl_external_platform.d/10_nvidia_wayland.json

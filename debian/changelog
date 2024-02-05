@@ -1,0 +1,11 @@
+egl-wayland (1:1.1.24-1pop1) UNRELEASED; urgency=medium
+
+  * Backport
+
+ -- Michael Murphy <michael@mmurphy.dev>  Tue, 03 Nov 2026 17:36:57 +0100
+
+egl-wayland (1:1.1.20-1pop1) jammy; urgency=medium
+
+  * Backport
+
+ -- Michael Aaron Murphy <michael@mmurphy.dev>  Thu, 28 Aug 2025 22:16:08 +0200

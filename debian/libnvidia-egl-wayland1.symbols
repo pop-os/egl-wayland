@@ -1,0 +1,12 @@
+libnvidia-egl-wayland.so.1 libnvidia-egl-wayland1 #MINVER#
+ loadEGLExternalPlatform@Base 1:1.1.20-1pop1
+ wlEglCreateSurfaceExport2@Base 1:1.1.20-1pop1
+ wlEglCreateSurfaceExport@Base 1:1.1.20-1pop1
+ wlEglGetSurfaceStreamExport@Base 1:1.1.20-1pop1
+ wlEglPostPresentExport2@Base 1:1.1.20-1pop1
+ wlEglPostPresentExport@Base 1:1.1.20-1pop1
+ wlEglPrePresentExport@Base 1:1.1.20-1pop1
+ wlEglProcessPresentationFeedbacksExport@Base 1:1.1.20-1pop1
+ wlEglWaitAllPresentationFeedbacksExport@Base 1:1.1.20-1pop1
+ wl_drm_interface@Base 1:1.1.20-1pop1
+ wl_eglstream_controller_interface@Base 1:1.1.20-1pop1
