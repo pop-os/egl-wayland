@@ -1,0 +1,15 @@
+#!/usr/bin/make -f
+
+override_dh_autoreconf:
+
+override_dh_auto_install:
+	dh_auto_install
+
+	install -m 0755 -d debian/tmp/usr/share/egl/egl_external_platform.d/
+	install -pm 0644 debian/10_nvidia_wayland.json \
+		debian/tmp/usr/share/egl/egl_external_platform.d/
+
+%:
+	dh $@ \
+		--builddirectory=build/ \
+		--buildsystem=meson
