@@ -1,3 +1,9 @@
+egl-wayland (1:1.1.13-2pop3) jammy; urgency=medium
+
+  * egl-wayland: Validate and use the passed value of EGL_EXT_present_opaque
+
+ -- Michael Aaron Murphy <michael@mmurphy.dev>  Mon, 01 Jul 2024 17:38:22 +0200
+
 egl-wayland (1:1.1.13-2pop2) jammy; urgency=medium
 
   * Rebase with explicit sync patches
