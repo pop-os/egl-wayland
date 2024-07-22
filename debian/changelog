@@ -1,3 +1,9 @@
+egl-wayland (1:1.1.14-1pop1) jammy; urgency=medium
+
+  * Update to 1.1.14
+
+ -- Ian Douglas Scott <idscott@system76.com>  Mon, 22 Jul 2024 09:49:20 -0700
+
 egl-wayland (1:1.1.13-2pop3) jammy; urgency=medium
 
   * egl-wayland: Validate and use the passed value of EGL_EXT_present_opaque

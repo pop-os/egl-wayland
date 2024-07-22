@@ -431,12 +431,12 @@ registry_handle_global(void *data,
         display->wlStreamDpy = wl_registry_bind(registry,
                                                 name,
                                                 &wl_eglstream_display_interface,
-                                                version);
+                                                1);
     } else if (strcmp(interface, "wl_eglstream_controller") == 0) {
         display->wlStreamCtl = wl_registry_bind(registry,
                                                 name,
                                                 &wl_eglstream_controller_interface,
-                                                version);
+                                                version > 1 ? 2 : 1);
         display->wlStreamCtlVer = version;
     } else if (strcmp(interface, "zwp_linux_dmabuf_v1") == 0) {
         /*
@@ -460,7 +460,7 @@ registry_handle_global(void *data,
         display->wlDrmSyncobj = wl_registry_bind(registry,
                                                  name,
                                                  &wp_linux_drm_syncobj_manager_v1_interface,
-                                                 version);
+                                                 1);
     }
 }
 
@@ -569,7 +569,6 @@ dmabuf_feedback_check_done(void *data, struct zwp_linux_dmabuf_feedback_v1 *dmab
     WlServerProtocols *protocols = (WlServerProtocols *)data;
     (void) dmabuf_feedback;
 
-    assert(protocols->devId != 0);
     drmDevice *drm_device;
     assert(getDeviceFromDevId);
     if (getDeviceFromDevId(protocols->devId, 0, &drm_device) == 0) {
