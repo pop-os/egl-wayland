@@ -431,12 +431,12 @@ registry_handle_global(void *data,
         display->wlStreamDpy = wl_registry_bind(registry,
                                                 name,
                                                 &wl_eglstream_display_interface,
-                                                version);
+                                                1);
     } else if (strcmp(interface, "wl_eglstream_controller") == 0) {
         display->wlStreamCtl = wl_registry_bind(registry,
                                                 name,
                                                 &wl_eglstream_controller_interface,
-                                                version);
+                                                version > 1 ? 2 : 1);
         display->wlStreamCtlVer = version;
     } else if (strcmp(interface, "zwp_linux_dmabuf_v1") == 0) {
         /*
@@ -456,11 +456,12 @@ registry_handle_global(void *data,
                                                    &wp_presentation_interface,
                                                    version);
     } else if (strcmp(interface, "wp_linux_drm_syncobj_manager_v1") == 0 &&
-               display->supports_native_fence_sync) {
+               display->supports_native_fence_sync &&
+               display->supports_explicit_sync) {
         display->wlDrmSyncobj = wl_registry_bind(registry,
                                                  name,
                                                  &wp_linux_drm_syncobj_manager_v1_interface,
-                                                 version);
+                                                 1);
     }
 }
 
@@ -569,7 +570,6 @@ dmabuf_feedback_check_done(void *data, struct zwp_linux_dmabuf_feedback_v1 *dmab
     WlServerProtocols *protocols = (WlServerProtocols *)data;
     (void) dmabuf_feedback;
 
-    assert(protocols->devId != 0);
     drmDevice *drm_device;
     assert(getDeviceFromDevId);
     if (getDeviceFromDevId(protocols->devId, 0, &drm_device) == 0) {
@@ -1220,6 +1220,61 @@ fail:
     return EGL_NO_DISPLAY;
 }
 
+static void wlEglCheckDriverSyncSupport(WlEglDisplay *display)
+{
+    EGLSyncKHR  eglSync = EGL_NO_SYNC_KHR;
+    int         syncFd  = -1;
+    EGLDisplay  dpy     = display->devDpy->eglDisplay;
+    EGLint      attribs[5];
+    uint32_t    tmpSyncobj;
+    const char *disableExplicitSyncStr = getenv("__NV_DISABLE_EXPLICIT_SYNC");
+
+    /*
+     * Don't enable explicit sync if requested by the user or if we do not have
+     * the necessary EGL extensions.
+     */
+    if ((disableExplicitSyncStr && !strcmp(disableExplicitSyncStr, "1")) ||
+        !display->supports_native_fence_sync) {
+        return;
+    }
+
+    /* make a dummy fd to pass in */
+    if (drmSyncobjCreate(display->drmFd, 0, &tmpSyncobj) != 0) {
+        return;
+    }
+
+    if (drmSyncobjHandleToFD(display->drmFd, tmpSyncobj, &syncFd)) {
+        goto destroy;
+    }
+
+    /*
+     * This call is supposed to fail if the driver is new enough to support
+     * Explicit Sync. Since we don't have an easy way to detect the driver
+     * version number at the moment, we check for some error conditions added
+     * as part of the EGL driver support. Here we check that specifying a valid
+     * fd and a sync object status returns EGL_BAD_ATTRIBUTE.
+     */
+    attribs[0] = EGL_SYNC_NATIVE_FENCE_FD_ANDROID;
+    attribs[1] = syncFd;
+    attribs[2] = EGL_SYNC_STATUS;
+    attribs[3] = EGL_SIGNALED;
+    attribs[4] = EGL_NONE;
+    eglSync = display->data->egl.createSync(dpy, EGL_SYNC_NATIVE_FENCE_ANDROID,
+                                            attribs);
+
+    /* If the call failed then the driver version is recent enough */
+    if (eglSync == EGL_NO_SYNC_KHR &&
+        display->data->egl.getError() == EGL_BAD_ATTRIBUTE) {
+        display->supports_explicit_sync = true;
+    }
+
+destroy:
+    if (eglSync != EGL_NO_SYNC_KHR) {
+        display->data->egl.destroySync(dpy, eglSync);
+    }
+    drmSyncobjDestroy(display->drmFd, tmpSyncobj);
+}
+
 EGLBoolean wlEglInitializeHook(EGLDisplay dpy, EGLint *major, EGLint *minor)
 {
     WlEglDisplay      *display = wlEglAcquireDisplay(dpy);
@@ -1262,6 +1317,9 @@ EGLBoolean wlEglInitializeHook(EGLDisplay dpy, EGLint *major, EGLint *minor)
     if (dev_exts && wlEglFindExtension("EGL_ANDROID_native_fence_sync", dev_exts)) {
         display->supports_native_fence_sync = true;
     }
+
+    /* Check if we support explicit sync */
+    wlEglCheckDriverSyncSupport(display);
 
     // Set the initCount to 1. If something goes wrong, then terminateDisplay
     // will clean up and set it back to zero.
