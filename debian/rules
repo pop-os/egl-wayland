@@ -2,6 +2,9 @@
 
 override_dh_autoreconf:
 
+override_dh_builddeb:
+	dh_builddeb -- -Zzstd -z3
+
 override_dh_auto_install:
 	dh_auto_install
 
